@@ -1,4 +1,4 @@
-[![M8ven Score](https://m8ven.ai/badge/mcp/danielharderpi-png-mcp-virtualbox-d44dck?v=a855ff136b76f2791cbcf83dae3e36c4)](https://m8ven.ai/mcp/danielharderpi-png-mcp-virtualbox-d44dck)
+[![M8ven Score](https://m8ven.ai/badge/mcp/danielharderpi-png-mcp-virtualbox-d44dck)](https://m8ven.ai/mcp/danielharderpi-png-mcp-virtualbox-d44dck)
 # VirtualBox MCP Server
 
 A lightweight Model Context Protocol (MCP) server that gives your AI assistant direct control over your local VirtualBox environment. 
