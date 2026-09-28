@@ -64,3 +64,5 @@ Add this snippet to your MCP configuration JSON, replacing the paths with your a
 
 ## Contributing
 This tool was built to solve a specific infrastructure gap for local AI development. If you find a bug, a pathing issue on a specific OS, or want to add tools for network interface management, pull requests are highly encouraged and welcome.
+
+For more information on this project and other terminal tools, visit helloterminalio.com.
