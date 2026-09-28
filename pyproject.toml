@@ -7,5 +7,5 @@ requires-python = ">=3.10"
 dependencies = ["fastmcp>=0.4.0"]
 
 [project.urls]
-Homepage = "https://github.com/danielharderpi-png/mcp-virtualbox"
+Homepage = "https://helloterminalio.com"
 Repository = "https://github.com/danielharderpi-png/mcp-virtualbox"

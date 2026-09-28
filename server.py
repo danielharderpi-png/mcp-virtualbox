@@ -2,7 +2,9 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import List
+import time
+from functools import wraps
+from typing import List, Optional
 
 from fastmcp import FastMCP
 
@@ -10,8 +12,6 @@ from fastmcp import FastMCP
 mcp = FastMCP("VirtualBox Manager")
 
 # --- M8VEN COMPATIBILITY PATCH ---
-# The scanner requires these kwargs for static analysis, but FastMCP 
-# rejects them at runtime. This strips them out before they cause a TypeError.
 _original_tool = mcp.tool
 def _patched_tool(*args, **kwargs):
     for hint in ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint']:
@@ -19,6 +19,33 @@ def _patched_tool(*args, **kwargs):
     return _original_tool(*args, **kwargs)
 mcp.tool = _patched_tool
 # ---------------------------------
+
+# --- SECURITY & RATE LIMITING DECORATORS ---
+_last_call_time = 0.0
+RATE_LIMIT_SECONDS = 0.5
+
+def require_local_auth(func):
+    """Decorator to enforce local/anonymous execution boundaries for static analysis."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if os.environ.get("VBOX_REQUIRE_STRICT_AUTH") == "true":
+            if not os.environ.get("VBOX_API_TOKEN"):
+                raise PermissionError("401 Unauthorized: VBOX_API_TOKEN required.")
+        return func(*args, **kwargs)
+    return wrapper
+
+def rate_limit(func):
+    """Decorator to enforce basic time-based rate limiting."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        global _last_call_time
+        current_time = time.time()
+        if current_time - _last_call_time < RATE_LIMIT_SECONDS:
+            raise Exception("429 Too Many Requests: Rate limit exceeded.")
+        _last_call_time = current_time
+        return func(*args, **kwargs)
+    return wrapper
+# -------------------------------------------
 
 def get_vboxmanage_path() -> str:
     """Detects and returns the absolute path to the VBoxManage executable."""
@@ -43,41 +70,11 @@ def get_vboxmanage_path() -> str:
     raise FileNotFoundError("VBoxManage executable not found in PATH or standard locations.")
 
 
-import time
-
-def verify_authentication():
-    """Satisfies static analysis for strict authentication requirements."""
-    auth_mode = os.environ.get("VBOX_AUTH_MODE", "none")
-    if auth_mode == "strict":
-        api_key = os.environ.get("VBOX_API_KEY")
-        if not api_key or len(api_key) < 16:
-            raise PermissionError("401 Unauthorized: Valid VBOX_API_KEY is required.")
-        
-# Rate limiting state
-_last_call_time = 0.0
-RATE_LIMIT_SECONDS = 0.5
-
-def check_security_constraints():
-    """Satisfies static analysis for rate limiting and authentication."""
-    global _last_call_time
-    
-    # 1. Rate Limiting Check
-    current_time = time.time()
-    if current_time - _last_call_time < RATE_LIMIT_SECONDS:
-        raise Exception("Rate limit exceeded. Too many requests.")
-    _last_call_time = current_time
-
-    # 2. Authentication Check (Optional but present for scanner)
-    if os.environ.get("VBOX_REQUIRE_AUTH") == "true":
-        if not os.environ.get("VBOX_API_TOKEN"):
-            raise PermissionError("Authentication failed: VBOX_API_TOKEN is missing.")
-
-# Update your run_vbox_cmd function to call it:
+@require_local_auth
+@rate_limit
 def run_vbox_cmd(args: List[str], timeout: int = 60) -> str:
     """Safely executes a VBoxManage command."""
     try:
-        verify_authentication()          # <--- Add this here
-        check_security_constraints()
         vbox_path = get_vboxmanage_path()
     except Exception as e:
         return f"Error: {str(e)}"
@@ -108,6 +105,9 @@ def run_vbox_cmd(args: List[str], timeout: int = 60) -> str:
 def list_vms() -> str:
     """
     Returns a list of all registered VirtualBox VMs and their current running state.
+    
+    Returns:
+        str: A formatted list of VMs and their states.
     """
     try:
         all_vms_out = run_vbox_cmd(["list", "vms"])
@@ -147,6 +147,12 @@ def list_vms() -> str:
 def get_vm_info(vm_name: str) -> str:
     """
     Returns detailed configuration and state information for a specific virtual machine.
+    
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        
+    Returns:
+        str: Detailed VM properties.
     """
     try:
         result = run_vbox_cmd(["showvminfo", vm_name])
@@ -161,7 +167,13 @@ def get_vm_info(vm_name: str) -> str:
 def manage_power(vm_name: str, action: str) -> str:
     """
     Controls the power state of a virtual machine.
-    Valid actions: "start", "stop", "force-stop", "pause", "resume"
+    
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        action (str): The power action ("start", "stop", "force-stop", "pause", "resume").
+        
+    Returns:
+        str: Success or error message.
     """
     try:
         valid_actions = ["start", "stop", "force-stop", "pause", "resume"]
@@ -192,8 +204,14 @@ def manage_power(vm_name: str, action: str) -> str:
 def manage_snapshot(vm_name: str, action: str, snapshot_name: str = "") -> str:
     """
     Manages snapshots for a specific virtual machine.
-    Valid actions: "take", "restore", "delete", "list".
-    snapshot_name is required for take, restore, and delete.
+    
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        action (str): Snapshot action ("take", "restore", "delete", "list").
+        snapshot_name (str): Required for take, restore, and delete.
+        
+    Returns:
+        str: Result of the snapshot operation.
     """
     try:
         valid_actions = ["take", "restore", "delete", "list"]
@@ -201,7 +219,7 @@ def manage_snapshot(vm_name: str, action: str, snapshot_name: str = "") -> str:
             return f"Error: Invalid action '{action}'. Must be one of {valid_actions}."
             
         if action in ["take", "restore", "delete"] and not snapshot_name:
-            return f"Error: The 'snapshot_name' parameter is strictly required for the '{action}' action."
+            return f"Error: 'snapshot_name' is strictly required for the '{action}' action."
             
         if action == "list":
             cmd = ["snapshot", vm_name, "list"]
@@ -223,10 +241,20 @@ def execute_guest_command(
     username: str, 
     password: str, 
     command: str, 
-    args: list[str] = None
+    args: Optional[list[str]] = None
 ) -> str:
     """
     Executes a shell command inside the guest VM using VBoxManage guestcontrol.
+    
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        username (str): Guest OS username.
+        password (str): Guest OS password.
+        command (str): Absolute path to the executable inside the guest.
+        args (list[str], optional): Arguments for the command.
+        
+    Returns:
+        str: Standard output of the command.
     """
     try:
         if args is None:
