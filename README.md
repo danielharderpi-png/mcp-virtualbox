@@ -20,7 +20,7 @@ AI models are great at writing code, but they usually lack a safe, isolated envi
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/danielharderpi-png/mcp-virtualbox.git](https://github.com/danielharderpi-png/mcp-virtualbox.git)
+   git clone https://github.com/danielharderpi-png/mcp-virtualbox.git
    cd mcp-virtualbox
    ```
 
