@@ -1,0 +1,11 @@
+[project]
+name = "mcp-virtualbox"
+version = "1.0.0"
+description = "MCP server for VirtualBox management"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["fastmcp>=0.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/danielharderpi-png/mcp-virtualbox"
+Repository = "https://github.com/danielharderpi-png/mcp-virtualbox"

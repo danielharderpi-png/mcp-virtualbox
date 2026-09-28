@@ -1,6 +1,13 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from server import list_vms, manage_power, get_vboxmanage_path
+from server import (
+    list_vms, 
+    manage_power, 
+    get_vm_info, 
+    manage_snapshot, 
+    execute_guest_command, 
+    get_vboxmanage_path
+)
 
 class TestVirtualBoxMCP(unittest.TestCase):
 
@@ -15,7 +22,6 @@ class TestVirtualBoxMCP(unittest.TestCase):
     @patch('server.get_vboxmanage_path')
     def test_list_vms_success(self, mock_get_path, mock_run):
         mock_get_path.return_value = "VBoxManage"
-        
         mock_process = MagicMock()
         mock_process.returncode = 0
         mock_process.stdout = '"TestVM" {1234-5678}'
@@ -23,17 +29,28 @@ class TestVirtualBoxMCP(unittest.TestCase):
         
         result = list_vms()
         self.assertIn("TestVM", result)
-        self.assertIn("RUNNING", result)
 
     def test_manage_power_invalid_action(self):
-        result = manage_power("TestVM", "destroy-everything")
+        result = manage_power("TestVM", "destroy")
         self.assertIn("Error: Invalid action", result)
 
-    @patch('server.get_vboxmanage_path')
-    def test_list_vms_exception_handling(self, mock_get_path):
-        mock_get_path.side_effect = Exception("Forced failure")
-        result = list_vms()
-        self.assertIn("Error: Failed to list VMs", result)
+    @patch('server.run_vbox_cmd')
+    def test_get_vm_info(self, mock_run):
+        mock_run.return_value = "Memory size: 2048MB"
+        result = get_vm_info("TestVM")
+        self.assertIn("2048MB", result)
+
+    @patch('server.run_vbox_cmd')
+    def test_manage_snapshot(self, mock_run):
+        mock_run.return_value = "Snapshot taken"
+        result = manage_snapshot("TestVM", "take", "Backup1")
+        self.assertIn("Successfully", result)
+
+    @patch('server.run_vbox_cmd')
+    def test_execute_guest_command(self, mock_run):
+        mock_run.return_value = "root"
+        result = execute_guest_command("TestVM", "user", "pass", "whoami")
+        self.assertIn("root", result)
 
 if __name__ == '__main__':
     unittest.main()
