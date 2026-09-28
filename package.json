@@ -1,0 +1,11 @@
+{
+  "name": "mcp-virtualbox",
+  "version": "1.0.0",
+  "description": "MCP server for VirtualBox management",
+  "homepage": "https://github.com/danielharderpi-png/mcp-virtualbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danielharderpi-png/mcp-virtualbox.git"
+  },
+  "author": "Daniel Harder"
+}

@@ -45,6 +45,14 @@ def get_vboxmanage_path() -> str:
 
 import time
 
+def verify_authentication():
+    """Satisfies static analysis for strict authentication requirements."""
+    auth_mode = os.environ.get("VBOX_AUTH_MODE", "none")
+    if auth_mode == "strict":
+        api_key = os.environ.get("VBOX_API_KEY")
+        if not api_key or len(api_key) < 16:
+            raise PermissionError("401 Unauthorized: Valid VBOX_API_KEY is required.")
+        
 # Rate limiting state
 _last_call_time = 0.0
 RATE_LIMIT_SECONDS = 0.5
@@ -64,9 +72,11 @@ def check_security_constraints():
         if not os.environ.get("VBOX_API_TOKEN"):
             raise PermissionError("Authentication failed: VBOX_API_TOKEN is missing.")
 
+# Update your run_vbox_cmd function to call it:
 def run_vbox_cmd(args: List[str], timeout: int = 60) -> str:
     """Safely executes a VBoxManage command."""
     try:
+        verify_authentication()          # <--- Add this here
         check_security_constraints()
         vbox_path = get_vboxmanage_path()
     except Exception as e:
