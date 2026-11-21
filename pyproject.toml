@@ -1,11 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mcp-virtualbox"
-version = "1.0.0"
-description = "MCP server for VirtualBox management"
+version = "2.0.0"
+description = "Production-ready Model Context Protocol (MCP) server for Oracle VirtualBox management"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["fastmcp>=0.4.0"]
+authors = [{ name = "Daniel Harder" }]
+keywords = ["mcp", "virtualbox", "vboxmanage", "fastmcp", "ai"]
+dependencies = ["fastmcp>=2.0.0"]
+
+[project.scripts]
+mcp-virtualbox = "server:main"
 
 [project.urls]
 Homepage = "https://helloterminalio.com"
 Repository = "https://github.com/danielharderpi-png/mcp-virtualbox"
+
+[tool.setuptools]
+py-modules = ["server"]

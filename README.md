@@ -1,19 +1,22 @@
 # VirtualBox MCP Server
 
-A lightweight Model Context Protocol (MCP) server that gives your AI assistant direct control over your local VirtualBox environment. 
+A production-ready [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server built with FastMCP that gives your AI assistant safe, structured control over your local Oracle VirtualBox environment via `VBoxManage`.
 
-AI models are great at writing code, but they usually lack a safe, isolated environment to actually test it. This bridge allows any MCP-compatible AI (like Claude Desktop, Cline, or local agents) to interact with `VBoxManage`. Your AI can now spin up your virtual machines, take safety snapshots, and execute scripts directly inside the guest OS.
+Spin up headless sandboxes, snapshot state before risky changes, discover guest IP addresses, copy scripts in and out of VMs, configure NAT port forwarding or shared folders, capture screenshots, and run guest commands directly from your AI client.
 
 ## Features
-* **VM Discovery:** List all registered virtual machines and check if they are running or stopped.
-* **Power Management:** Start (headless by default), stop, force-stop, pause, and resume VMs.
-* **Snapshot Control:** Take, restore, delete, and list snapshots so the AI can create safe restore points before running risky code.
-* **Guest Execution:** Run shell commands and scripts directly inside the guest OS using `VBoxManage guestcontrol`.
+
+- **13 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle, snapshots, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, cloning, IP discovery, and screenshots.
+- **Native MCP Tool Annotations:** Accurate `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` hints so MCP clients know which operations mutate state.
+- **Credential Redaction & Env Fallbacks:** Passwords (`--password` / `--password-file`) are automatically scrubbed from error messages and logs, and can be supplied via `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` so credentials never appear in chat history.
+- **CLI Flag-Injection & Bounds Validation:** Rejects invalid/flag-prefixed identifiers (`--...`), validates port/resource ranges, and runs `VBoxManage` without `shell=True`.
+- **Thread-Safe Sliding-Window Rate Limiting:** Applied cleanly at the MCP tool boundary (configurable via `VBOX_MAX_CALLS_PER_MINUTE`) so multi-command tools like `list_vms` never self-throttle.
 
 ## Prerequisites
-* Python 3.10+
-* Oracle VirtualBox installed. (The server automatically checks your system PATH, with built-in fallback paths for standard Windows and Linux installations).
-* VirtualBox Guest Additions installed on the target VMs (strictly required if you want the AI to use the guest execution tool).
+
+- **Python 3.10+**
+- **Oracle VirtualBox** installed locally (`VBoxManage` in `PATH`, standard install directory, or via `VBOXMANAGE_PATH`).
+- **VirtualBox Guest Additions** installed in target VMs for `get_vm_ip`, `execute_guest_command`, `copy_to_guest`, `copy_from_guest`, and shared folders.
 
 ## Installation
 
@@ -24,44 +27,91 @@ AI models are great at writing code, but they usually lack a safe, isolated envi
    ```
 
 2. Create and activate a virtual environment:
+
    **Windows:**
    ```cmd
    python -m venv venv
    venv\Scripts\activate
    ```
-   **Linux/macOS:**
+
+   **Linux / macOS:**
    ```bash
    python3 -m venv venv
    source venv/bin/activate
    ```
 
-3. Install dependencies:
+3. Install dependencies (or install editable with the `mcp-virtualbox` console script):
    ```bash
    pip install -r requirements.txt
+   # Or:
+   pip install -e .
    ```
 
 ## Configuration
 
-To use this server, you need to add it to your MCP client's configuration file. Point the `command` to the Python executable inside your virtual environment, and the `args` to the `server.py` file.
-
-### Example: Claude Desktop or Cline (VS Code)
-Add this snippet to your MCP configuration JSON, replacing the paths with your actual absolute paths:
+Add the server to your MCP client configuration (Claude Desktop, Cline, Cursor, etc.):
 
 ```json
 {
   "mcpServers": {
     "virtualbox-manager": {
       "command": "/absolute/path/to/mcp-virtualbox/venv/bin/python",
-      "args": [
-        "/absolute/path/to/mcp-virtualbox/server.py"
-      ]
+      "args": ["/absolute/path/to/mcp-virtualbox/server.py"],
+      "env": {
+        "VBOX_GUEST_USER": "sandbox",
+        "VBOX_GUEST_PASSWORD": "your-low-priv-guest-password"
+      }
     }
   }
 }
 ```
-*(Windows users: Remember to use double backslashes in your JSON paths, e.g., `C:\\path\\to\\venv\\Scripts\\python.exe`)*
 
-## Contributing
-This tool was built to solve a specific infrastructure gap for local AI development. If you find a bug, a pathing issue on a specific OS, or want to add tools for network interface management, pull requests are highly encouraged and welcome.
+*(Windows example command: `C:\\path\\to\\mcp-virtualbox\\venv\\Scripts\\python.exe`)*
 
-For more information on this project and other terminal tools, visit helloterminalio.com.
+### Environment Variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VBOXMANAGE_PATH` | Auto-detected | Explicit path to the `VBoxManage` executable. |
+| `VBOX_GUEST_USER` | *(none)* | Default guest OS username for `guestcontrol` tools. |
+| `VBOX_GUEST_PASSWORD` | *(none)* | Default guest OS password so secrets stay out of prompts. |
+| `VBOX_MAX_CALLS_PER_MINUTE` | `60` | Sliding-window tool rate limit (`0` disables limiting). |
+| `VBOX_REQUIRE_STRICT_AUTH` | `false` | Set to `true` to require `VBOX_API_TOKEN`. |
+| `VBOX_API_TOKEN` | *(none)* | Token checked when `VBOX_REQUIRE_STRICT_AUTH=true`. |
+| `VBOX_LOG_LEVEL` | `WARNING` | `stderr` log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+
+## Tool Reference
+
+| Tool | Description | Hints |
+| --- | --- | --- |
+| `list_vms` | List all registered VMs (or `running_only=True`) with UUIDs and states. | Read-only, Idempotent |
+| `get_vm_info` | Structured summary of CPU/RAM/NICs/forwards/folders/snapshots (`verbose=True` for raw). | Read-only, Idempotent |
+| `get_vm_ip` | Discover guest IPv4/IPv6 addresses and Guest Additions version. | Read-only, Idempotent |
+| `manage_power` | Power actions: `start` (`headless`/`gui`/`separate`), `stop`, `force-stop`, `reset`, `savestate`, `pause`, `resume`. | Destructive |
+| `manage_snapshot` | `list`, `take` (with `--description` and `--live`), `restore`, or `delete` snapshots. | Destructive |
+| `execute_guest_command` | Run an executable inside a guest with optional `args`, `cwd`, `env`, and `timeout`. | Destructive, Open-world |
+| `copy_to_guest` | Copy a file or directory from the host into the guest VM (`recursive` supported). | Idempotent |
+| `copy_from_guest` | Copy a file or directory from the guest VM back to the host. | Idempotent |
+| `manage_port_forwarding` | `list`, `add`, or `delete` NAT port-forwarding rules (offline or live on running VMs). | Mutating |
+| `manage_shared_folders` | `list`, `add`, or `remove` permanent or transient shared folders. | Mutating |
+| `configure_vm_resources` | Update `cpus`, `memory_mb`, `vram_mb`, and `clipboard_mode` on a stopped VM. | Idempotent |
+| `clone_vm` | Create full or linked clones (from a snapshot) and register them. | Mutating |
+| `take_vm_screenshot` | Capture a PNG screenshot of a running VM display for debugging. | Idempotent |
+
+**Resource:** `vbox://vms` exposes the registered VM inventory directly as an MCP resource.
+
+## Security Best Practices
+
+1. Create a dedicated, **low-privilege account** inside your guest VMs for automation rather than using `root` or `Administrator`.
+2. Pass guest credentials via `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` in your MCP client's `env` configuration instead of typing passwords in conversation prompts.
+3. Always take a snapshot (`manage_snapshot(..., action="take")`) before testing destructive commands or untrusted software in a VM.
+
+## Running Tests
+
+```bash
+python -m unittest test_server.py -v
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE). For more terminal tools, visit [helloterminalio.com](https://helloterminalio.com).

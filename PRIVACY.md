@@ -1,18 +1,20 @@
 # Privacy Policy
 
-**Last Updated:** September 2026
+**Last Updated:** November 2026
 
 ## Overview
-The `mcp-virtualbox` server is a local software component designed to run exclusively on your local hardware. It acts as an interface between an AI agent and your local Oracle VirtualBox installation.
+The `mcp-virtualbox` server is a local software component designed to run exclusively on your local hardware. It acts as an interface between an MCP-compatible AI client and your local Oracle VirtualBox (`VBoxManage`) installation.
 
 ## Data Collection
-This software collects **no data whatsoever**. 
+This software collects **no data whatsoever**:
 - No telemetry, analytics, or usage data is gathered.
-- No information is transmitted across the internet by this server.
-- All command executions, credentials, and virtual machine metadata remain strictly on your local machine.
+- No information is transmitted over the internet by this server.
+- All command executions, VM states, file transfers, and screenshots remain strictly on your local machine.
+
+## Credential Handling & Security
+- Guest credentials passed to `execute_guest_command`, `copy_to_guest`, and `copy_from_guest` are forwarded locally to `VBoxManage` only.
+- All `--password` and `--password-file` values are redacted (`***`) from diagnostic logs and error messages.
+- To avoid passing guest passwords inside AI chat prompts, configure `VBOX_GUEST_USER` and `VBOX_GUEST_PASSWORD` in your MCP client's environment block and use a dedicated, low-privilege guest account inside your VMs.
 
 ## Third-Party Access
-Because this software operates entirely locally, no data is shared with third parties. Any prompts, inputs, or system states evaluated by the AI models you use are governed by the privacy policies of those respective model providers (e.g., Anthropic, OpenAI). 
-
-## Security
-Guest execution tools require passing credentials locally via command-line arguments to `VBoxManage`. We strongly recommend creating dedicated, low-privilege guest accounts within your VMs for AI automation purposes.
+Because this server operates locally over `stdio`, no data is sent to third parties by `mcp-virtualbox`. Prompts and tool outputs shared with an LLM provider are governed by that provider's privacy policy.
