@@ -40,6 +40,8 @@ VALID_PROTOCOLS = ("tcp", "udp")
 VALID_FOLDER_ACTIONS = ("list", "add", "remove")
 VALID_CLIPBOARD_MODES = ("disabled", "hosttoguest", "guesttohost", "bidirectional")
 VALID_CLONE_MODES = ("machine", "machineandchildren", "all")
+VALID_NIC_MODES = ("nat", "bridged", "hostonly", "intnet", "none")
+VALID_STORAGE_ACTIONS = ("list", "attach-iso", "eject-iso")
 
 _VM_LINE_RE = re.compile(r'^"(?P<name>.*)"\s+\{(?P<uuid>[^}]+)\}\s*$')
 
@@ -1241,6 +1243,620 @@ def take_vm_screenshot(vm_name: str, output_path: str) -> str:
         return f"Error: Failed to capture screenshot for VM '{vm}': {res.error}"
 
     return f"Screenshot saved for VM '{vm}' at '{abs_path}'."
+
+
+def _parse_os_types(output: str) -> list[tuple[str, str, str]]:
+    """Parse `VBoxManage list ostypes` blocks into (id, description, family) tuples."""
+    entries: list[tuple[str, str, str]] = []
+    current: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if "ID" in current:
+                entries.append(
+                    (
+                        current["ID"],
+                        current.get("Description", ""),
+                        current.get("Family Desc") or current.get("Family ID", "Unknown"),
+                    )
+                )
+                current = {}
+            continue
+        if ":" in line:
+            key, val = line.split(":", 1)
+            key = key.strip()
+            if key == "ID" and "ID" in current:
+                entries.append(
+                    (
+                        current["ID"],
+                        current.get("Description", ""),
+                        current.get("Family Desc") or current.get("Family ID", "Unknown"),
+                    )
+                )
+                current = {}
+            current[key] = val.strip()
+    if "ID" in current:
+        entries.append(
+            (
+                current["ID"],
+                current.get("Description", ""),
+                current.get("Family Desc") or current.get("Family ID", "Unknown"),
+            )
+        )
+    return entries
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def list_os_types(search: str = "") -> str:
+    """
+    List supported VirtualBox guest OS type IDs (for use with `create_vm`).
+
+    Args:
+        search (str): Optional case-insensitive filter matched against OS ID, description, or family.
+
+    Returns:
+        str: Markdown list of matching guest OS types.
+    """
+    res = run_vbox_cmd(["list", "ostypes"])
+    if not res.ok:
+        return f"Error: Failed to list guest OS types: {res.error}"
+
+    entries = _parse_os_types(res.stdout)
+    if not entries:
+        return "No guest OS types returned by VBoxManage."
+
+    query = search.strip().lower()
+    if query:
+        entries = [
+            item
+            for item in entries
+            if query in item[0].lower() or query in item[1].lower() or query in item[2].lower()
+        ]
+        if not entries:
+            return f"No guest OS types matching '{search.strip()}'."
+
+    lines = [f"- `{os_id}` — {desc} [{family}]" for os_id, desc, family in entries]
+    header = f"### Supported Guest OS Types ({len(lines)})"
+    return header + "\n" + "\n".join(lines)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def create_vm(
+    vm_name: str,
+    os_type: str = "Ubuntu_64",
+    cpus: int = 2,
+    memory_mb: int = 2048,
+    vram_mb: int = 16,
+    disk_size_mb: int = 20480,
+    nic_mode: Literal["nat", "bridged", "hostonly", "intnet", "none"] = "nat",
+    iso_path: str = "",
+    base_folder: str = "",
+) -> str:
+    """
+    Create and register a new VirtualBox VM with optional virtual disk and installer ISO.
+
+    Args:
+        vm_name (str): Name for the new virtual machine.
+        os_type (str): VirtualBox OS type ID (e.g. "Ubuntu_64", "Debian_64", "Windows11_64").
+        cpus (int): Virtual CPU count (1-128).
+        memory_mb (int): Base RAM in MB (128-262144).
+        vram_mb (int): Video memory in MB (1-256).
+        disk_size_mb (int): New VDI disk size in MB (0 skips disk creation; max 2097152).
+        nic_mode (str): NIC 1 mode ("nat", "bridged", "hostonly", "intnet", or "none").
+        iso_path (str): Optional host path to an installer `.iso` file to attach to IDE.
+        base_folder (str): Optional base directory where VM files are stored.
+
+    Returns:
+        str: Markdown summary of the created VM or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        os_id = _validate_identifier(os_type, "os_type")
+        valid_cpus = _validate_int_range(cpus, "cpus", 1, 128)
+        valid_mem = _validate_int_range(memory_mb, "memory_mb", 128, 262144)
+        valid_vram = _validate_int_range(vram_mb, "vram_mb", 1, 256)
+        valid_disk = _validate_int_range(disk_size_mb, "disk_size_mb", 0, 2097152)
+        iso = _validate_path_arg(iso_path, "iso_path") if iso_path.strip() else ""
+        base_dir = _validate_path_arg(base_folder, "base_folder") if base_folder.strip() else ""
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if nic_mode not in VALID_NIC_MODES:
+        return f"Error: Invalid nic_mode '{nic_mode}'. Must be one of {list(VALID_NIC_MODES)}."
+    if iso and not os.path.isfile(iso):
+        return f"Error: ISO file '{iso}' does not exist."
+
+    create_cmd = ["createvm", "--name", vm, "--ostype", os_id, "--register"]
+    if base_dir:
+        create_cmd.extend(["--basefolder", base_dir])
+    res = run_vbox_cmd(create_cmd)
+    if not res.ok:
+        return f"Error: Failed to create VM '{vm}': {res.error}"
+
+    def _run_step(step_name: str, args: list[str], timeout: int = 60) -> Optional[str]:
+        step_res = run_vbox_cmd(args, timeout=timeout)
+        if not step_res.ok:
+            return (
+                f"Error: VM '{vm}' was registered, but step '{step_name}' failed: "
+                f"{step_res.error}"
+            )
+        return None
+
+    err = _run_step(
+        "modifyvm",
+        [
+            "modifyvm",
+            vm,
+            "--cpus",
+            str(valid_cpus),
+            "--memory",
+            str(valid_mem),
+            "--vram",
+            str(valid_vram),
+            "--nic1",
+            nic_mode,
+        ],
+    )
+    if err:
+        return err
+
+    vdi_path = "None (skipped)"
+    if valid_disk > 0:
+        info_res = run_vbox_cmd(["showvminfo", vm, "--machinereadable"])
+        cfg_file = parse_machinereadable(info_res.stdout).get("CfgFile", "") if info_res.ok else ""
+        if cfg_file:
+            vm_dir = os.path.dirname(cfg_file)
+        elif base_dir:
+            vm_dir = os.path.join(base_dir, vm)
+        else:
+            vm_dir = os.path.abspath(vm)
+        vdi_path = os.path.join(vm_dir, f"{vm}.vdi")
+
+        for step_name, args in (
+            (
+                "add SATA controller",
+                ["storagectl", vm, "--name", "SATA Controller", "--add", "sata", "--controller", "IntelAhci"],
+            ),
+            (
+                "create VDI disk",
+                ["createmedium", "disk", "--filename", vdi_path, "--size", str(valid_disk), "--format", "VDI"],
+            ),
+            (
+                "attach VDI disk",
+                [
+                    "storageattach",
+                    vm,
+                    "--storagectl",
+                    "SATA Controller",
+                    "--port",
+                    "0",
+                    "--device",
+                    "0",
+                    "--type",
+                    "hdd",
+                    "--medium",
+                    vdi_path,
+                ],
+            ),
+        ):
+            err = _run_step(step_name, args, timeout=120)
+            if err:
+                return err
+
+    if iso:
+        for step_name, args in (
+            ("add IDE controller", ["storagectl", vm, "--name", "IDE Controller", "--add", "ide"]),
+            (
+                "attach ISO",
+                [
+                    "storageattach",
+                    vm,
+                    "--storagectl",
+                    "IDE Controller",
+                    "--port",
+                    "0",
+                    "--device",
+                    "0",
+                    "--type",
+                    "dvddrive",
+                    "--medium",
+                    iso,
+                ],
+            ),
+        ):
+            err = _run_step(step_name, args)
+            if err:
+                return err
+
+    disk_summary = f"`{vdi_path}` ({valid_disk} MB)" if valid_disk > 0 else "None"
+    return "\n".join(
+        [
+            f"### Created VM: {vm}",
+            f"- **OS Type:** `{os_id}`",
+            f"- **Resources:** {valid_cpus} vCPU(s), {valid_mem} MB RAM, {valid_vram} MB VRAM",
+            f"- **NIC 1:** `{nic_mode}`",
+            f"- **Disk:** {disk_summary}",
+            f"- **ISO:** {f'`{iso}`' if iso else 'None'}",
+        ]
+    )
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def unattended_install(
+    vm_name: str,
+    iso_path: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    full_name: str = "",
+    hostname: str = "",
+    time_zone: str = "UTC",
+    install_additions: bool = True,
+    start_vm: bool = False,
+) -> str:
+    """
+    Configure an unattended OS installation on a VM from an installer ISO.
+
+    Args:
+        vm_name (str): Name or UUID of an existing VM.
+        iso_path (str): Host path to a supported OS installer `.iso`.
+        username (str, optional): Guest admin/user account name (falls back to VBOX_GUEST_USER).
+        password (str, optional): Account password (falls back to VBOX_GUEST_PASSWORD).
+        full_name (str): Optional full name for the created guest user.
+        hostname (str): Optional guest hostname.
+        time_zone (str): Guest timezone (default "UTC").
+        install_additions (bool): Install VirtualBox Guest Additions automatically.
+        start_vm (bool): Immediately boot the VM headless to begin installation.
+
+    Returns:
+        str: Unattended setup confirmation or redacted error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        iso = _validate_path_arg(iso_path, "iso_path")
+        resolved_user, resolved_pass = _resolve_guest_credentials(username, password)
+        valid_host = _validate_identifier(hostname, "hostname") if hostname.strip() else ""
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not os.path.isfile(iso):
+        return f"Error: ISO file '{iso}' does not exist."
+    if not resolved_pass:
+        return (
+            "Error: password is required for unattended installation "
+            "(pass password or set VBOX_GUEST_PASSWORD)."
+        )
+
+    tz = time_zone.strip()
+    if tz and (tz.startswith("-") or any(ord(ch) < 32 for ch in tz)):
+        return "Error: time_zone contains invalid characters."
+    clean_full = full_name.strip()
+    if clean_full and any(ord(ch) < 32 for ch in clean_full):
+        return "Error: full_name contains invalid control characters."
+
+    cmd = [
+        "unattended",
+        "install",
+        vm,
+        f"--iso={iso}",
+        f"--user={resolved_user}",
+        f"--password={resolved_pass}",
+    ]
+    if clean_full:
+        cmd.append(f"--full-user-name={clean_full}")
+    if valid_host:
+        cmd.append(f"--hostname={valid_host}")
+    if tz:
+        cmd.append(f"--time-zone={tz}")
+    if install_additions:
+        cmd.append("--install-additions")
+    if start_vm:
+        cmd.append("--start-vm=headless")
+
+    res = run_vbox_cmd(cmd, timeout=180)
+    if not res.ok:
+        return f"Error: Unattended install setup failed for VM '{vm}': {res.error}"
+
+    details = f"\n```\n{res.stdout}\n```" if res.stdout else ""
+    return f"Successfully configured unattended installation for VM '{vm}' using '{iso}'.{details}"
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def import_vm(
+    appliance_path: str,
+    vm_name: str = "",
+    cpus: Optional[int] = None,
+    memory_mb: Optional[int] = None,
+    dry_run: bool = False,
+    timeout: int = 600,
+) -> str:
+    """
+    Import a pre-built `.ova` or `.ovf` virtual appliance into VirtualBox.
+
+    Args:
+        appliance_path (str): Host path to an `.ova` or `.ovf` file.
+        vm_name (str): Optional override name for the imported VM.
+        cpus (int, optional): Override vCPU count (1-128).
+        memory_mb (int, optional): Override RAM in MB (128-262144).
+        dry_run (bool): Inspect appliance manifest/requirements without importing.
+        timeout (int): Import timeout in seconds (1-3600).
+
+    Returns:
+        str: Import summary or error details.
+    """
+    try:
+        path = _validate_path_arg(appliance_path, "appliance_path")
+        valid_name = _validate_identifier(vm_name, "vm_name") if vm_name.strip() else ""
+        valid_cpus = _validate_int_range(cpus, "cpus", 1, 128) if cpus is not None else None
+        valid_mem = (
+            _validate_int_range(memory_mb, "memory_mb", 128, 262144)
+            if memory_mb is not None
+            else None
+        )
+        valid_timeout = _validate_int_range(timeout, "timeout", 1, 3600)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not os.path.isfile(path):
+        return f"Error: Appliance file '{path}' does not exist."
+    if not path.lower().endswith((".ova", ".ovf")):
+        return "Error: appliance_path must point to a .ova or .ovf file."
+
+    cmd = ["import", path]
+    if dry_run:
+        cmd.append("--dry-run")
+    if valid_name:
+        cmd.extend(["--vsys", "0", "--vmname", valid_name])
+    if valid_cpus is not None:
+        cmd.extend(["--vsys", "0", "--cpus", str(valid_cpus)])
+    if valid_mem is not None:
+        cmd.extend(["--vsys", "0", "--memory", str(valid_mem)])
+
+    res = run_vbox_cmd(cmd, timeout=valid_timeout)
+    if not res.ok:
+        return f"Error: Failed to import appliance '{path}': {res.error}"
+
+    action_word = "Dry-run inspection completed" if dry_run else "Successfully imported appliance"
+    details = f"\n```\n{res.stdout}\n```" if res.stdout else ""
+    return f"{action_word} for '{path}'.{details}"
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def export_vm(vm_name: str, output_path: str, timeout: int = 600) -> str:
+    """
+    Export a stopped virtual machine to an `.ova` or `.ovf` appliance archive.
+
+    Args:
+        vm_name (str): Name or UUID of the VM to export.
+        output_path (str): Host file path for the exported `.ova`/`.ovf` file (`.ova` appended if omitted).
+        timeout (int): Export timeout in seconds (1-3600).
+
+    Returns:
+        str: Confirmation with output path or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        path = _validate_path_arg(output_path, "output_path")
+        valid_timeout = _validate_int_range(timeout, "timeout", 1, 3600)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not path.lower().endswith((".ova", ".ovf")):
+        path = f"{path}.ova"
+
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    res = run_vbox_cmd(["export", vm, "--output", abs_path], timeout=valid_timeout)
+    if not res.ok:
+        return f"Error: Failed to export VM '{vm}': {res.error}"
+
+    return f"Successfully exported VM '{vm}' to '{abs_path}'."
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_storage(
+    vm_name: str,
+    action: Literal["list", "attach-iso", "eject-iso"],
+    controller: str = "IDE Controller",
+    port: int = 0,
+    device: int = 0,
+    iso_path: str = "",
+) -> str:
+    """
+    List storage controllers/media, mount an ISO image, or eject a virtual DVD drive.
+
+    Args:
+        vm_name (str): Name or UUID of the virtual machine.
+        action (str): One of "list", "attach-iso", "eject-iso".
+        controller (str): Storage controller name (default "IDE Controller").
+        port (int): Controller port index (0-31).
+        device (int): Device slot on port (0-3).
+        iso_path (str): Host path to the `.iso` file (required for "attach-iso").
+
+    Returns:
+        str: Storage inventory or confirmation message.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        valid_port = _validate_int_range(port, "port", 0, 31)
+        valid_device = _validate_int_range(device, "device", 0, 3)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action not in VALID_STORAGE_ACTIONS:
+        return f"Error: Invalid action '{action}'. Must be one of {list(VALID_STORAGE_ACTIONS)}."
+
+    if action == "list":
+        res = run_vbox_cmd(["showvminfo", vm, "--machinereadable"])
+        if not res.ok:
+            return f"Error: Failed to inspect storage for VM '{vm}': {res.error}"
+
+        parsed = parse_machinereadable(res.stdout)
+        controllers = [
+            val for key, val in parsed.items() if key.startswith("storagecontrollername") and val
+        ]
+        ctrl_set = set(controllers)
+        media_lines: list[str] = []
+        slot_re = re.compile(r"^(.+)-(\d+)-(\d+)$")
+        ignored_suffixes = ("-ImageUUID", "-IsEjected", "-TempEject", "-HotPluggable", "-Type")
+        for key, val in parsed.items():
+            if not val or val.lower() == "none":
+                continue
+            match = slot_re.match(key)
+            if not match:
+                continue
+            prefix = match.group(1)
+            if prefix.endswith(ignored_suffixes):
+                continue
+            if ctrl_set and prefix not in ctrl_set:
+                continue
+            media_lines.append(f"- `{key}` -> `{val}`")
+
+        sections = [f"### Storage for VM: {vm}"]
+        sections.append(
+            "**Controllers:** " + (", ".join(f"`{c}`" for c in controllers) if controllers else "None")
+        )
+        if media_lines:
+            sections.append("#### Attached Media\n" + "\n".join(media_lines))
+        else:
+            sections.append("No attached storage media found.")
+        return "\n".join(sections)
+
+    try:
+        ctrl = _validate_identifier(controller, "controller")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action == "attach-iso":
+        try:
+            iso = _validate_path_arg(iso_path, "iso_path")
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if not os.path.isfile(iso):
+            return f"Error: ISO file '{iso}' does not exist."
+        medium = iso
+    else:
+        medium = "emptydrive"
+
+    res = run_vbox_cmd(
+        [
+            "storageattach",
+            vm,
+            "--storagectl",
+            ctrl,
+            "--port",
+            str(valid_port),
+            "--device",
+            str(valid_device),
+            "--type",
+            "dvddrive",
+            "--medium",
+            medium,
+        ]
+    )
+    if not res.ok:
+        return f"Error: Failed to {action} on VM '{vm}': {res.error}"
+
+    if action == "attach-iso":
+        return f"Successfully attached ISO '{medium}' to VM '{vm}' ({ctrl} {valid_port}:{valid_device})."
+    return f"Successfully ejected virtual DVD drive on VM '{vm}' ({ctrl} {valid_port}:{valid_device})."
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def delete_vm(vm_name: str, delete_files: bool = True, confirm: bool = False) -> str:
+    """
+    Unregister and optionally permanently delete a VirtualBox VM and its files.
+
+    Args:
+        vm_name (str): Name or UUID of the VM to delete.
+        delete_files (bool): When True, also delete virtual disks, snapshots, and config files.
+        confirm (bool): Safety guard — must be explicitly set to True to execute deletion.
+
+    Returns:
+        str: Deletion confirmation, safety prompt, or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not confirm:
+        scope = (
+            "unregister the VM AND permanently delete all associated disk images and snapshots"
+            if delete_files
+            else "unregister the VM while keeping its files on disk"
+        )
+        return (
+            f"Confirmation required: call `delete_vm(vm_name='{vm}', delete_files={delete_files}, "
+            f"confirm=True)` to {scope}."
+        )
+
+    cmd = ["unregistervm", vm, "--delete"] if delete_files else ["unregistervm", vm]
+    res = run_vbox_cmd(cmd, timeout=120)
+    if not res.ok:
+        return f"Error: Failed to delete VM '{vm}': {res.error}"
+
+    if delete_files:
+        return f"Successfully unregistered and permanently deleted VM '{vm}' and its files."
+    return f"Successfully unregistered VM '{vm}' (files preserved on disk)."
 
 
 @mcp.resource("vbox://vms")

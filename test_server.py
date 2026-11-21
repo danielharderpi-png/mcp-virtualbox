@@ -565,19 +565,313 @@ class TestVirtualBoxMCP(unittest.TestCase):
         out = server.resource_vms()
         self.assertIn("**LabVM** (`9999`) [STOPPED]", out)
 
+    @patch("server.run_vbox_cmd")
+    def test_list_os_types_all_and_filtered(self, mock_cmd: MagicMock) -> None:
+        raw = "\n".join(
+            [
+                "ID:          Ubuntu_64",
+                "Description: Ubuntu (64-bit)",
+                "Family ID:   Linux",
+                "Family Desc: Linux",
+                "",
+                "ID:          Windows11_64",
+                "Description: Windows 11 (64-bit)",
+                "Family ID:   Windows",
+                "Family Desc: Microsoft Windows",
+            ]
+        )
+        mock_cmd.return_value = server.CommandResult(0, raw, "")
+
+        all_out = server.list_os_types()
+        self.assertIn("Supported Guest OS Types (2)", all_out)
+        self.assertIn("Ubuntu_64", all_out)
+        self.assertIn("Windows11_64", all_out)
+
+        filtered = server.list_os_types(search="ubuntu")
+        self.assertIn("Ubuntu_64", filtered)
+        self.assertNotIn("Windows11_64", filtered)
+
+        none_found = server.list_os_types(search="plan9")
+        self.assertIn("No guest OS types matching", none_found)
+
+    @patch("server.os.path.isfile", return_value=True)
+    @patch("server.run_vbox_cmd")
+    def test_create_vm_with_disk_and_iso(
+        self, mock_cmd: MagicMock, _mock_isfile: MagicMock
+    ) -> None:
+        mock_cmd.side_effect = [
+            server.CommandResult(0, "", ""),  # createvm
+            server.CommandResult(0, "", ""),  # modifyvm
+            server.CommandResult(0, 'CfgFile="/vms/NewBox/NewBox.vbox"', ""),  # showvminfo
+            server.CommandResult(0, "", ""),  # storagectl SATA
+            server.CommandResult(0, "", ""),  # createmedium
+            server.CommandResult(0, "", ""),  # storageattach hdd
+            server.CommandResult(0, "", ""),  # storagectl IDE
+            server.CommandResult(0, "", ""),  # storageattach dvddrive
+        ]
+
+        out = server.create_vm(
+            "NewBox",
+            os_type="Ubuntu_64",
+            cpus=4,
+            memory_mb=4096,
+            vram_mb=32,
+            disk_size_mb=32768,
+            nic_mode="bridged",
+            iso_path="/isos/ubuntu.iso",
+        )
+        self.assertIn("### Created VM: NewBox", out)
+        self.assertIn("32768 MB", out)
+        self.assertIn("/isos/ubuntu.iso", out)
+
+        calls = [c.args[0] for c in mock_cmd.call_args_list]
+        self.assertEqual(calls[0], ["createvm", "--name", "NewBox", "--ostype", "Ubuntu_64", "--register"])
+        self.assertEqual(
+            calls[1],
+            ["modifyvm", "NewBox", "--cpus", "4", "--memory", "4096", "--vram", "32", "--nic1", "bridged"],
+        )
+        self.assertEqual(calls[2], ["showvminfo", "NewBox", "--machinereadable"])
+        self.assertEqual(
+            calls[3],
+            ["storagectl", "NewBox", "--name", "SATA Controller", "--add", "sata", "--controller", "IntelAhci"],
+        )
+        expected_vdi = os.path.join("/vms/NewBox", "NewBox.vdi")
+        self.assertEqual(
+            calls[4],
+            ["createmedium", "disk", "--filename", expected_vdi, "--size", "32768", "--format", "VDI"],
+        )
+        self.assertEqual(
+            calls[5],
+            [
+                "storageattach",
+                "NewBox",
+                "--storagectl",
+                "SATA Controller",
+                "--port",
+                "0",
+                "--device",
+                "0",
+                "--type",
+                "hdd",
+                "--medium",
+                expected_vdi,
+            ],
+        )
+        self.assertEqual(calls[6], ["storagectl", "NewBox", "--name", "IDE Controller", "--add", "ide"])
+        self.assertEqual(
+            calls[7],
+            [
+                "storageattach",
+                "NewBox",
+                "--storagectl",
+                "IDE Controller",
+                "--port",
+                "0",
+                "--device",
+                "0",
+                "--type",
+                "dvddrive",
+                "--medium",
+                "/isos/ubuntu.iso",
+            ],
+        )
+
+    @patch("server.os.path.isfile", return_value=False)
+    @patch("server.run_vbox_cmd")
+    def test_create_vm_without_disk_and_missing_iso(
+        self, mock_cmd: MagicMock, _mock_isfile: MagicMock
+    ) -> None:
+        err_iso = server.create_vm("NewBox", iso_path="/missing.iso")
+        self.assertIn("does not exist", err_iso)
+        mock_cmd.assert_not_called()
+
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        out = server.create_vm("DisklessBox", disk_size_mb=0)
+        self.assertIn("**Disk:** None", out)
+        self.assertEqual(mock_cmd.call_count, 2)
+
+    @patch("server.os.path.isfile", return_value=True)
+    @patch("server.get_vboxmanage_path", return_value="VBoxManage")
+    @patch("server.subprocess.run")
+    def test_unattended_install_success_and_password_redacted_on_error(
+        self, mock_run: MagicMock, _mock_path: MagicMock, _mock_isfile: MagicMock
+    ) -> None:
+        with patch.dict(os.environ, {"VBOX_GUEST_USER": "", "VBOX_GUEST_PASSWORD": ""}, clear=False):
+            missing_pw = server.unattended_install("NewBox", "/isos/u.iso", username="dev")
+            self.assertIn("password is required", missing_pw)
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="Unattended setup OK", stderr="")
+        with patch.dict(os.environ, {"VBOX_GUEST_USER": "auto", "VBOX_GUEST_PASSWORD": "EnvSecret99!"}, clear=False):
+            ok_out = server.unattended_install(
+                "NewBox",
+                "/isos/u.iso",
+                hostname="sandbox",
+                full_name="Sandbox User",
+                start_vm=True,
+            )
+        self.assertIn("Successfully configured unattended installation", ok_out)
+        called_cmd = mock_run.call_args.args[0]
+        self.assertIn("--user=auto", called_cmd)
+        self.assertIn("--password=EnvSecret99!", called_cmd)
+        self.assertIn("--install-additions", called_cmd)
+        self.assertIn("--start-vm=headless", called_cmd)
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Bad password VerySecret42!")
+        err_out = server.unattended_install(
+            "NewBox", "/isos/u.iso", username="dev", password="VerySecret42!"
+        )
+        self.assertNotIn("VerySecret42!", err_out)
+        self.assertIn("--password=***", err_out)
+
+    @patch("server.os.path.isfile", return_value=True)
+    @patch("server.run_vbox_cmd")
+    def test_import_vm_success_dry_run_and_invalid_extension(
+        self, mock_cmd: MagicMock, _mock_isfile: MagicMock
+    ) -> None:
+        bad_ext = server.import_vm("/tmp/image.zip")
+        self.assertIn("must point to a .ova or .ovf file", bad_ext)
+        mock_cmd.assert_not_called()
+
+        mock_cmd.return_value = server.CommandResult(0, "Virtual system 0", "")
+        dry_out = server.import_vm(
+            "/appliances/ubuntu.ova", vm_name="ImportedBox", cpus=2, memory_mb=2048, dry_run=True
+        )
+        self.assertIn("Dry-run inspection completed", dry_out)
+        mock_cmd.assert_called_with(
+            [
+                "import",
+                "/appliances/ubuntu.ova",
+                "--dry-run",
+                "--vsys",
+                "0",
+                "--vmname",
+                "ImportedBox",
+                "--vsys",
+                "0",
+                "--cpus",
+                "2",
+                "--vsys",
+                "0",
+                "--memory",
+                "2048",
+            ],
+            timeout=600,
+        )
+
+        imp_out = server.import_vm("/appliances/ubuntu.ovf")
+        self.assertIn("Successfully imported appliance", imp_out)
+
+    @patch("server.os.makedirs")
+    @patch("server.run_vbox_cmd")
+    def test_export_vm_success_and_ova_extension(
+        self, mock_cmd: MagicMock, mock_makedirs: MagicMock
+    ) -> None:
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        out = server.export_vm("DevVM", "exports/devbox")
+        mock_makedirs.assert_called()
+        called = mock_cmd.call_args.args[0]
+        self.assertEqual(called[:3], ["export", "DevVM", "--output"])
+        self.assertTrue(called[3].endswith("devbox.ova"))
+        self.assertIn("Successfully exported VM 'DevVM'", out)
+
+    @patch("server.os.path.isfile", return_value=True)
+    @patch("server.run_vbox_cmd")
+    def test_manage_storage_list_attach_and_eject_iso(
+        self, mock_cmd: MagicMock, _mock_isfile: MagicMock
+    ) -> None:
+        mr = "\n".join(
+            [
+                'storagecontrollername0="SATA Controller"',
+                'storagecontrollername1="IDE Controller"',
+                'SATA Controller-0-0="/vms/Dev/Dev.vdi"',
+                'SATA Controller-ImageUUID-0-0="uuid-1"',
+                'IDE Controller-0-0="/isos/boot.iso"',
+            ]
+        )
+        mock_cmd.return_value = server.CommandResult(0, mr, "")
+        listed = server.manage_storage("DevVM", "list")
+        self.assertIn("`SATA Controller`", listed)
+        self.assertIn("`SATA Controller-0-0` -> `/vms/Dev/Dev.vdi`", listed)
+        self.assertIn("`IDE Controller-0-0` -> `/isos/boot.iso`", listed)
+        self.assertNotIn("ImageUUID", listed)
+
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        attached = server.manage_storage(
+            "DevVM", "attach-iso", controller="IDE Controller", port=1, device=0, iso_path="/isos/net.iso"
+        )
+        mock_cmd.assert_called_with(
+            [
+                "storageattach",
+                "DevVM",
+                "--storagectl",
+                "IDE Controller",
+                "--port",
+                "1",
+                "--device",
+                "0",
+                "--type",
+                "dvddrive",
+                "--medium",
+                "/isos/net.iso",
+            ]
+        )
+        self.assertIn("Successfully attached ISO", attached)
+
+        ejected = server.manage_storage("DevVM", "eject-iso", controller="IDE Controller", port=1, device=0)
+        mock_cmd.assert_called_with(
+            [
+                "storageattach",
+                "DevVM",
+                "--storagectl",
+                "IDE Controller",
+                "--port",
+                "1",
+                "--device",
+                "0",
+                "--type",
+                "dvddrive",
+                "--medium",
+                "emptydrive",
+            ]
+        )
+        self.assertIn("Successfully ejected", ejected)
+
+    @patch("server.run_vbox_cmd")
+    def test_delete_vm_requires_confirm_and_deletes_when_confirmed(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        guard_msg = server.delete_vm("DisposableVM", delete_files=True, confirm=False)
+        self.assertIn("Confirmation required", guard_msg)
+        mock_cmd.assert_not_called()
+
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        del_all = server.delete_vm("DisposableVM", delete_files=True, confirm=True)
+        mock_cmd.assert_called_with(["unregistervm", "DisposableVM", "--delete"], timeout=120)
+        self.assertIn("permanently deleted", del_all)
+
+        del_keep = server.delete_vm("DisposableVM", delete_files=False, confirm=True)
+        mock_cmd.assert_called_with(["unregistervm", "DisposableVM"], timeout=120)
+        self.assertIn("files preserved on disk", del_keep)
+
     def test_native_tool_annotations_and_no_monkey_patch(self) -> None:
         self.assertFalse(hasattr(server, "_patched_tool"))
         tools = asyncio.run(server.mcp.list_tools())
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 20)
         by_name = {t.name: t for t in tools}
 
-        for ro_name in ("list_vms", "get_vm_info", "get_vm_ip"):
+        for ro_name in ("list_vms", "get_vm_info", "get_vm_ip", "list_os_types", "export_vm"):
             ann = by_name[ro_name].annotations
             assert ann is not None
             self.assertTrue(ann.read_only_hint)
             self.assertFalse(ann.destructive_hint)
 
-        for dest_name in ("manage_power", "manage_snapshot", "execute_guest_command"):
+        for dest_name in (
+            "manage_power",
+            "manage_snapshot",
+            "execute_guest_command",
+            "unattended_install",
+            "delete_vm",
+        ):
             ann = by_name[dest_name].annotations
             assert ann is not None
             self.assertFalse(ann.read_only_hint)

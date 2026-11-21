@@ -6,7 +6,7 @@ Spin up headless sandboxes, snapshot state before risky changes, discover guest 
 
 ## Features
 
-- **13 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle, snapshots, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, cloning, IP discovery, and screenshots.
+- **20 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle (creation, unattended OS install, cloning, `.ova`/`.ovf` import/export, guarded deletion), snapshots, storage/ISO control, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, IP discovery, and screenshots.
 - **Native MCP Tool Annotations:** Accurate `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` hints so MCP clients know which operations mutate state.
 - **Credential Redaction & Env Fallbacks:** Passwords (`--password` / `--password-file`) are automatically scrubbed from error messages and logs, and can be supplied via `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` so credentials never appear in chat history.
 - **CLI Flag-Injection & Bounds Validation:** Rejects invalid/flag-prefixed identifiers (`--...`), validates port/resource ranges, and runs `VBoxManage` without `shell=True`.
@@ -97,6 +97,13 @@ Add the server to your MCP client configuration (Claude Desktop, Cline, Cursor, 
 | `configure_vm_resources` | Update `cpus`, `memory_mb`, `vram_mb`, and `clipboard_mode` on a stopped VM. | Idempotent |
 | `clone_vm` | Create full or linked clones (from a snapshot) and register them. | Mutating |
 | `take_vm_screenshot` | Capture a PNG screenshot of a running VM display for debugging. | Idempotent |
+| `list_os_types` | List supported VirtualBox guest OS type IDs (with optional `search` filter). | Read-only, Idempotent |
+| `create_vm` | Create and register a new VM with CPUs, RAM, VRAM, NIC mode, VDI disk, and optional ISO. | Mutating |
+| `unattended_install` | Configure hands-free OS installation from an ISO with Guest Additions support. | Destructive |
+| `import_vm` | Import a pre-built `.ova` or `.ovf` appliance (supports `dry_run` and overrides). | Mutating |
+| `export_vm` | Export a stopped VM into an `.ova` or `.ovf` appliance archive. | Read-only, Idempotent |
+| `manage_storage` | `list` controllers/attached media, `attach-iso`, or `eject-iso` on virtual DVD drives. | Idempotent |
+| `delete_vm` | Guarded VM teardown (`confirm=True` required; optionally removes disk files). | Destructive |
 
 **Resource:** `vbox://vms` exposes the registered VM inventory directly as an MCP resource.
 

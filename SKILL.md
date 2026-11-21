@@ -32,3 +32,10 @@ Use this skill when interacting with local VirtualBox virtual machines through t
    - Discover a running VM's guest IP addresses and Guest Additions status with `get_vm_ip`.
    - Expose guest services to localhost with `manage_port_forwarding(..., action="add", is_running=True)`.
    - If a VM fails to boot, hangs at a login/BIOS prompt, or exhibits GUI errors, capture its framebuffer with `take_vm_screenshot` and inspect the PNG.
+
+6. **Provisioning, appliances, media, and safe teardown**
+   - Look up valid guest OS IDs first with `list_os_types(search=...)` before calling `create_vm`.
+   - For hands-free builds from an installer ISO, create the VM with `create_vm` and automate installation with `unattended_install` (preferring `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` env vars).
+   - For pre-built images, use `import_vm(..., dry_run=True)` to inspect requirements before importing, and `export_vm` to archive configured VMs as `.ova` files.
+   - Mount or swap installer ISOs on existing VMs with `manage_storage(..., action="attach-iso" | "eject-iso")`.
+   - Only tear down disposable VMs with `delete_vm(..., confirm=True)` after double-checking `delete_files`.
