@@ -8,8 +8,8 @@ The `mcp-virtualbox` server is a local software component designed to run exclus
 ## Data Collection
 This software collects **no data whatsoever**:
 - No telemetry, analytics, or usage data is gathered.
-- No information is transmitted over the internet by this server.
-- All command executions, VM states, file transfers, and screenshots remain strictly on your local machine.
+- No user or host information is transmitted over the internet by this server.
+- All command executions, VM states, file transfers, and screenshots remain strictly on your local machine. The only optional outbound network activity occurs when you explicitly invoke `provision_kali_vm(..., download=True)`, which downloads and SHA-256-verifies official pre-built Kali Linux VirtualBox images and `SHA256SUMS` over HTTPS.
 
 ## Credential Handling & Security
 - Guest credentials passed to `execute_guest_command`, `copy_to_guest`, and `copy_from_guest` are forwarded locally to `VBoxManage` only.
@@ -17,4 +17,4 @@ This software collects **no data whatsoever**:
 - To avoid passing guest passwords inside AI chat prompts, configure `VBOX_GUEST_USER` and `VBOX_GUEST_PASSWORD` in your MCP client's environment block and use a dedicated, low-privilege guest account inside your VMs.
 
 ## Third-Party Access
-Because this server operates locally over `stdio`, no data is sent to third parties by `mcp-virtualbox`. Prompts and tool outputs shared with an LLM provider are governed by that provider's privacy policy.
+Because this server operates locally over `stdio`, no prompt or local telemetry data is sent to third parties by `mcp-virtualbox` (optional image downloads in `provision_kali_vm(..., download=True)` fetch public Kali release artifacts only). Prompts and tool outputs shared with an LLM provider are governed by that provider's privacy policy.

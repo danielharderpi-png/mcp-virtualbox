@@ -1,7 +1,12 @@
 import asyncio
+import hashlib
+import io
 import os
 import subprocess
+import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import MagicMock, patch
 
 import server
@@ -853,10 +858,659 @@ class TestVirtualBoxMCP(unittest.TestCase):
         mock_cmd.assert_called_with(["unregistervm", "DisposableVM"], timeout=120)
         self.assertIn("files preserved on disk", del_keep)
 
+    # --- Kali Provisioning & Registration ---
+
+    def test_parse_kali_sha256sums_valid_and_rejects_unsafe(self) -> None:
+        h_old = "a" * 64
+        h_new = "B" * 64
+        h_iso = "c" * 64
+        h_trav = "d" * 64
+        content = "\n".join(
+            [
+                f"{h_iso}  kali-linux-2026.3-installer-amd64.iso",
+                f"{h_old}  kali-linux-2026.2-virtualbox-amd64.7z",
+                f"{h_new} *kali-linux-2026.3-virtualbox-amd64.7z",
+                f"{h_trav}  ../kali-linux-2026.9-virtualbox-amd64.7z",
+            ]
+        )
+        filename, digest = server._parse_kali_sha256sums(content)
+        self.assertEqual(filename, "kali-linux-2026.3-virtualbox-amd64.7z")
+        self.assertEqual(digest, h_new.lower())
+
+        unsafe_only = "\n".join(
+            [
+                f"{h_trav}  ../kali-linux-2026.3-virtualbox-amd64.7z",
+                f"{h_trav}  sub/kali-linux-2026.3-virtualbox-amd64.7z",
+                f"{h_iso}  kali-linux-2026.3-installer-amd64.iso",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            server._parse_kali_sha256sums(unsafe_only)
+
+    def test_validate_archive_members_blocks_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server._validate_archive_members(
+                [
+                    "kali-linux-2026.3-virtualbox-amd64",
+                    "kali-linux-2026.3-virtualbox-amd64/kali.vbox",
+                    "kali-linux-2026.3-virtualbox-amd64/kali.vdi",
+                    "./kali-linux-2026.3-virtualbox-amd64/Logs/VBox.log",
+                ],
+                tmpdir,
+            )
+
+            with self.assertRaises(ValueError):
+                server._validate_archive_members([], tmpdir)
+
+            for bad in (
+                "../evil.txt",
+                "/etc/passwd",
+                r"C:\Windows\evil.dll",
+                "sub/../../escape.txt",
+                "bad\x00file",
+                "   ",
+            ):
+                with self.assertRaises(ValueError):
+                    server._validate_archive_members([bad], tmpdir)
+
+    def test_parse_vbox_metadata_namespaced_and_plain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ns_vbox = os.path.join(tmpdir, "ns.vbox")
+            with open(ns_vbox, "w", encoding="utf-8") as f:
+                f.write(
+                    '<?xml version="1.0"?>\n'
+                    '<VirtualBox xmlns="http://www.virtualbox.org/" version="1.19-windows">\n'
+                    '  <Machine uuid="{11111111-2222-3333-4444-555555555555}" '
+                    'name="kali-linux-2026.3-virtualbox-amd64" OSType="Debian_64"/>\n'
+                    "</VirtualBox>\n"
+                )
+            self.assertEqual(
+                server._parse_vbox_metadata(ns_vbox),
+                (
+                    "kali-linux-2026.3-virtualbox-amd64",
+                    "11111111-2222-3333-4444-555555555555",
+                    "Debian_64",
+                ),
+            )
+
+            plain_vbox = os.path.join(tmpdir, "plain.vbox")
+            with open(plain_vbox, "w", encoding="utf-8") as f:
+                f.write('<VirtualBox><Machine uuid="{aaaa-bbbb}" name="KaliPlain" OSType="Linux_64"/></VirtualBox>')
+            self.assertEqual(
+                server._parse_vbox_metadata(plain_vbox),
+                ("KaliPlain", "aaaa-bbbb", "Linux_64"),
+            )
+
+            no_machine = os.path.join(tmpdir, "nomachine.vbox")
+            with open(no_machine, "w", encoding="utf-8") as f:
+                f.write("<VirtualBox/>")
+            with self.assertRaises(ValueError):
+                server._parse_vbox_metadata(no_machine)
+
+            bad_xml = os.path.join(tmpdir, "bad.vbox")
+            with open(bad_xml, "w", encoding="utf-8") as f:
+                f.write("<VirtualBox><broken")
+            with self.assertRaises(ValueError):
+                server._parse_vbox_metadata(bad_xml)
+
+    def test_extract_7z_archive_7z_and_bsdtar_and_blocks_zipslip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive = os.path.join(tmpdir, "kali.7z")
+            target_7z = os.path.join(tmpdir, "out_7z")
+            slt_out = "\n".join(
+                [
+                    "Listing archive: kali.7z",
+                    "",
+                    "Path = kali.7z",
+                    "Type = 7z",
+                    "----------",
+                    "Path = kali/kali.vbox",
+                    "Folder = -",
+                    "",
+                    "Path = kali/kali.vdi",
+                    "Folder = -",
+                ]
+            )
+            with patch("server._find_7z_extractor", return_value=("7z", "7z.exe")), patch(
+                "server.subprocess.run"
+            ) as mock_run:
+                mock_run.side_effect = [
+                    MagicMock(returncode=0, stdout=slt_out, stderr=""),
+                    MagicMock(returncode=0, stdout="", stderr=""),
+                ]
+                res = server._extract_7z_archive(archive, target_7z, timeout=300)
+                self.assertEqual(res, os.path.abspath(target_7z))
+                self.assertEqual(mock_run.call_args_list[0].args[0], ["7z.exe", "l", "-slt", archive])
+                self.assertEqual(
+                    mock_run.call_args_list[1].args[0],
+                    ["7z.exe", "x", "-y", f"-o{target_7z}", archive],
+                )
+
+            target_tar = os.path.join(tmpdir, "out_tar")
+            with patch("server._find_7z_extractor", return_value=("bsdtar", "tar")), patch(
+                "server.subprocess.run"
+            ) as mock_run:
+                mock_run.side_effect = [
+                    MagicMock(returncode=0, stdout="kali/kali.vbox\nkali/kali.vdi\n", stderr=""),
+                    MagicMock(returncode=0, stdout="", stderr=""),
+                ]
+                res = server._extract_7z_archive(archive, target_tar, timeout=300)
+                self.assertEqual(res, os.path.abspath(target_tar))
+                self.assertEqual(mock_run.call_args_list[0].args[0], ["tar", "-tf", archive])
+                self.assertEqual(
+                    mock_run.call_args_list[1].args[0],
+                    ["tar", "-xf", archive, "-C", target_tar],
+                )
+
+            target_bad = os.path.join(tmpdir, "out_bad")
+            with patch("server._find_7z_extractor", return_value=("bsdtar", "tar")), patch(
+                "server.subprocess.run"
+            ) as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="../escape.txt\n", stderr="")
+                with self.assertRaises(ValueError):
+                    server._extract_7z_archive(archive, target_bad, timeout=300)
+                self.assertEqual(mock_run.call_count, 1)
+
+    def test_download_kali_image_downloads_verifies_caches_and_rejects_bad_url(self) -> None:
+        payload = b"fake-7z-archive-bytes-for-kali-test"
+        expected_sha = hashlib.sha256(payload).hexdigest()
+        sums_body = f"{expected_sha}  kali-linux-2026.3-virtualbox-amd64.7z\n".encode("utf-8")
+
+        class _FakeResp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_opener = MagicMock()
+            fake_opener.open.side_effect = [
+                _FakeResp(sums_body),
+                _FakeResp(payload),
+                _FakeResp(sums_body),
+            ]
+            with patch("server._build_https_opener", return_value=fake_opener):
+                path1, sha1, cached1 = server._download_kali_image(tmpdir, verify_checksum=True)
+                self.assertFalse(cached1)
+                self.assertEqual(sha1, expected_sha)
+                self.assertTrue(os.path.isfile(path1))
+                self.assertFalse(os.path.exists(path1 + ".part"))
+
+                # Second invocation hits verified cache without downloading the archive again.
+                path2, sha2, cached2 = server._download_kali_image(tmpdir, verify_checksum=True)
+                self.assertTrue(cached2)
+                self.assertEqual(path2, path1)
+                self.assertEqual(sha2, expected_sha)
+                self.assertEqual(fake_opener.open.call_count, 3)
+
+            # Checksum mismatch cleans up the `.part` file.
+            mismatch_dir = os.path.join(tmpdir, "mismatch")
+            bad_opener = MagicMock()
+            bad_opener.open.side_effect = [
+                _FakeResp(sums_body),
+                _FakeResp(b"corrupted-payload"),
+            ]
+            with patch("server._build_https_opener", return_value=bad_opener):
+                with self.assertRaises(ValueError) as ctx:
+                    server._download_kali_image(mismatch_dir, verify_checksum=True)
+                self.assertIn("checksum mismatch", str(ctx.exception))
+                expected_part = os.path.join(
+                    mismatch_dir, "kali-linux-2026.3-virtualbox-amd64.7z.part"
+                )
+                self.assertFalse(os.path.exists(expected_part))
+
+            # Reject insecure base URL schemes and embedded credentials.
+            for bad_url in (
+                "http://cdimage.kali.org/current/",
+                "file:///etc/passwd",
+                "https://user:pass@cdimage.kali.org/current/",
+            ):
+                with patch.dict(os.environ, {"VBOX_KALI_IMAGE_BASE_URL": bad_url}, clear=False):
+                    with self.assertRaises(ValueError):
+                        server._download_kali_image(tmpdir)
+
+            # HTTPS opener only registers HTTPSHandler (no HTTPHandler/FileHandler/FTPHandler/DataHandler).
+            opener = server._build_https_opener()
+            handler_types = {type(h) for h in opener.handlers}
+            self.assertIn(urllib.request.HTTPSHandler, handler_types)
+            self.assertNotIn(urllib.request.HTTPHandler, handler_types)
+            self.assertNotIn(urllib.request.FileHandler, handler_types)
+            self.assertNotIn(urllib.request.FTPHandler, handler_types)
+            self.assertNotIn(urllib.request.DataHandler, handler_types)
+            self.assertIn("https", opener.handle_open)
+            for disallowed_scheme in ("file", "ftp", "data"):
+                self.assertNotIn(disallowed_scheme, opener.handle_open)
+
+            # Redirect handler rejects downgrades away from HTTPS.
+            handler = server._HttpsOnlyRedirectHandler()
+            req = urllib.request.Request("https://cdimage.kali.org/current/SHA256SUMS")
+            for redir_url in ("http://mirror.example.org/file", "file:///tmp/x"):
+                with self.assertRaises(urllib.error.URLError):
+                    handler.redirect_request(req, None, 302, "Found", {}, redir_url)
+
+    @patch("server.run_vbox_cmd")
+    def test_register_vm_from_vbox_dir_and_7z(self, mock_cmd: MagicMock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vm_dir = os.path.join(tmpdir, "KaliPrebuilt")
+            os.makedirs(vm_dir)
+            vbox_file = os.path.join(vm_dir, "KaliPrebuilt.vbox")
+            with open(vbox_file, "w", encoding="utf-8") as f:
+                f.write(
+                    '<?xml version="1.0"?>'
+                    '<VirtualBox xmlns="http://www.virtualbox.org/">'
+                    '<Machine uuid="{aaaa-1111}" name="kali-orig" OSType="Debian_64"/>'
+                    "</VirtualBox>"
+                )
+            # Backup `.vbox-prev` must be ignored by `_find_vbox_file`.
+            with open(vbox_file + "-prev", "w", encoding="utf-8") as f:
+                f.write("<VirtualBox/>")
+
+            mock_cmd.return_value = server.CommandResult(0, "", "")
+            out_vbox = server.register_vm(
+                vbox_file,
+                vm_name="Kali-Custom",
+                cpus=4,
+                memory_mb=8192,
+                vram_mb=128,
+                nic_mode="nat",
+                clipboard_mode="bidirectional",
+            )
+            self.assertIn("### Registered VM: Kali-Custom", out_vbox)
+            self.assertIn("`aaaa-1111`", out_vbox)
+            calls = [c.args[0] for c in mock_cmd.call_args_list]
+            self.assertEqual(calls[0], ["registervm", os.path.abspath(vbox_file)])
+            self.assertEqual(
+                calls[1],
+                [
+                    "modifyvm",
+                    "aaaa-1111",
+                    "--name",
+                    "Kali-Custom",
+                    "--cpus",
+                    "4",
+                    "--memory",
+                    "8192",
+                    "--vram",
+                    "128",
+                    "--nic1",
+                    "nat",
+                    "--clipboard-mode",
+                    "bidirectional",
+                ],
+            )
+
+            # Directory source locates the single `.vbox` file.
+            mock_cmd.reset_mock()
+            out_dir = server.register_vm(vm_dir)
+            self.assertIn("### Registered VM: kali-orig", out_dir)
+            mock_cmd.assert_called_once_with(["registervm", os.path.abspath(vbox_file)], timeout=120)
+
+            # `.7z` extraction + registration.
+            mock_cmd.reset_mock()
+            archive_7z = os.path.join(tmpdir, "kali.7z")
+            with open(archive_7z, "wb") as f:
+                f.write(b"7z")
+            extract_target = os.path.join(tmpdir, "extracted_vm")
+
+            def _fake_extract(_arch: str, dest: str, timeout: int = 600) -> str:
+                os.makedirs(dest, exist_ok=True)
+                inner_vbox = os.path.join(dest, "KaliExtracted.vbox")
+                with open(inner_vbox, "w", encoding="utf-8") as xf:
+                    xf.write('<VirtualBox><Machine uuid="{bbbb-2222}" name="Kali7z" OSType="Debian_64"/></VirtualBox>')
+                return dest
+
+            with patch("server._extract_7z_archive", side_effect=_fake_extract) as mock_extract:
+                out_7z = server.register_vm(archive_7z, extract_dir=extract_target)
+                mock_extract.assert_called_once()
+                self.assertIn("### Registered VM: Kali7z", out_7z)
+                self.assertIn("Extracted Directory", out_7z)
+
+            # Non-empty existing extract directory is rejected before extracting.
+            non_empty = os.path.join(tmpdir, "nonempty")
+            os.makedirs(non_empty)
+            with open(os.path.join(non_empty, "stale.txt"), "w", encoding="utf-8") as f:
+                f.write("occupied")
+            err_nonempty = server.register_vm(archive_7z, extract_dir=non_empty)
+            self.assertIn("already exists and is not empty", err_nonempty)
+
+            # Invalid extension rejected.
+            bad_zip = os.path.join(tmpdir, "image.zip")
+            with open(bad_zip, "wb") as f:
+                f.write(b"zip")
+            self.assertIn("must be an existing .vbox file", server.register_vm(bad_zip))
+
+            # Crafted `.vbox` with missing UUID and flag-prefixed name is rejected before `modifyvm`.
+            mock_cmd.reset_mock()
+            evil_vbox = os.path.join(tmpdir, "evil.vbox")
+            with open(evil_vbox, "w", encoding="utf-8") as f:
+                f.write('<VirtualBox><Machine name="--evil" OSType="Debian_64"/></VirtualBox>')
+            evil_out = server.register_vm(evil_vbox, cpus=2)
+            self.assertIn("cannot start with '-'", evil_out)
+            mock_cmd.assert_not_called()
+
+    @patch("server.run_vbox_cmd")
+    def test_provision_kali_vm_from_local_7z_with_snapshot_and_start(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive = os.path.join(tmpdir, "kali-linux-2026.3-virtualbox-amd64.7z")
+            with open(archive, "wb") as f:
+                f.write(b"7z")
+            vbox_root = os.path.join(tmpdir, "VirtualBox VMs")
+
+            def _fake_extract(_arch: str, dest: str, timeout: int = 600) -> str:
+                os.makedirs(dest, exist_ok=True)
+                with open(os.path.join(dest, "kali.vbox"), "w", encoding="utf-8") as xf:
+                    xf.write(
+                        '<VirtualBox xmlns="http://www.virtualbox.org/">'
+                        '<Machine uuid="{cccc-3333}" name="kali-linux-2026.3" OSType="Debian_64"/>'
+                        "</VirtualBox>"
+                    )
+                return dest
+
+            mock_cmd.side_effect = [
+                server.CommandResult(0, "", ""),  # list vms
+                server.CommandResult(0, f"Default machine folder: {vbox_root}", ""),  # systemproperties
+                server.CommandResult(0, "", ""),  # registervm
+                server.CommandResult(0, "", ""),  # modifyvm
+                server.CommandResult(0, "", ""),  # snapshot take
+                server.CommandResult(0, "", ""),  # startvm
+            ]
+
+            with patch("server._extract_7z_archive", side_effect=_fake_extract) as mock_ext:
+                out = server.provision_kali_vm(
+                    vm_name="Kali-Agent",
+                    image_path=archive,
+                    start_vm=True,
+                )
+
+            expected_dest = os.path.join(vbox_root, "Kali-Agent")
+            mock_ext.assert_called_once_with(os.path.abspath(archive), expected_dest, timeout=1800)
+
+            calls = [c.args[0] for c in mock_cmd.call_args_list]
+            self.assertEqual(calls[0], ["list", "vms"])
+            self.assertEqual(calls[1], ["list", "systemproperties"])
+            self.assertEqual(calls[2], ["registervm", os.path.join(expected_dest, "kali.vbox")])
+            self.assertEqual(
+                calls[3],
+                [
+                    "modifyvm",
+                    "cccc-3333",
+                    "--name",
+                    "Kali-Agent",
+                    "--cpus",
+                    "2",
+                    "--memory",
+                    "4096",
+                    "--vram",
+                    "128",
+                    "--nic1",
+                    "nat",
+                    "--clipboard-mode",
+                    "bidirectional",
+                ],
+            )
+            self.assertEqual(
+                calls[4],
+                [
+                    "snapshot",
+                    "Kali-Agent",
+                    "take",
+                    "clean-base",
+                    "--description",
+                    "Clean Kali Linux agent baseline",
+                ],
+            )
+            self.assertEqual(calls[5], ["startvm", "Kali-Agent", "--type", "headless"])
+
+            self.assertIn("### Provisioned Kali Linux VM: Kali-Agent", out)
+            self.assertIn("2 vCPU(s), 4096 MB RAM, 128 MB VRAM", out)
+            self.assertIn("`clean-base` (created)", out)
+            self.assertIn("RUNNING (`headless`)", out)
+            self.assertIn("username `kali` / password `kali`", out)
+
+    @patch("server.run_vbox_cmd")
+    def test_provision_kali_vm_from_base_vm_linked_and_full_clone(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        mock_cmd.side_effect = [
+            server.CommandResult(0, '"Kali-Base" {1111-2222}', ""),
+            server.CommandResult(0, "", ""),  # clonevm
+            server.CommandResult(0, "", ""),  # modifyvm
+            server.CommandResult(0, "", ""),  # snapshot
+            server.CommandResult(0, "", ""),  # startvm
+        ]
+        out_linked = server.provision_kali_vm(
+            vm_name="Kali-Worker-1",
+            base_vm="Kali-Base",
+            linked_clone=True,
+            start_vm=True,
+            start_mode="gui",
+        )
+        calls = [c.args[0] for c in mock_cmd.call_args_list]
+        self.assertEqual(
+            calls[1],
+            [
+                "clonevm",
+                "Kali-Base",
+                "--name",
+                "Kali-Worker-1",
+                "--mode",
+                "machine",
+                "--register",
+                "--snapshot",
+                "clean-base",
+                "--options",
+                "link",
+            ],
+        )
+        self.assertEqual(calls[4], ["startvm", "Kali-Worker-1", "--type", "gui"])
+        self.assertIn("Linked clone from `Kali-Base`", out_linked)
+
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [
+            server.CommandResult(0, '"Kali-Base" {1111-2222}', ""),
+            server.CommandResult(0, "", ""),  # clonevm
+            server.CommandResult(0, "", ""),  # modifyvm
+        ]
+        out_full = server.provision_kali_vm(
+            vm_name="Kali-Full",
+            base_vm="Kali-Base",
+            linked_clone=False,
+            take_clean_snapshot=False,
+        )
+        calls_full = [c.args[0] for c in mock_cmd.call_args_list]
+        self.assertEqual(
+            calls_full[1],
+            ["clonevm", "Kali-Base", "--name", "Kali-Full", "--mode", "machine", "--register"],
+        )
+        self.assertIn("Full clone from `Kali-Base`", out_full)
+        self.assertIn("Baseline Snapshot:** Skipped", out_full)
+
+    @patch("server.run_vbox_cmd")
+    def test_provision_kali_vm_download_and_ova_and_env_fallbacks(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dl_archive = os.path.join(tmpdir, "kali-linux-2026.3-virtualbox-amd64.7z")
+            with open(dl_archive, "wb") as f:
+                f.write(b"7z")
+            vbox_dir = os.path.join(tmpdir, "vbox_out")
+
+            def _fake_extract(_arch: str, dest: str, timeout: int = 600) -> str:
+                os.makedirs(dest, exist_ok=True)
+                with open(os.path.join(dest, "kali.vbox"), "w", encoding="utf-8") as xf:
+                    xf.write('<VirtualBox><Machine uuid="{dddd-4444}" name="KaliDL" OSType="Debian_64"/></VirtualBox>')
+                return dest
+
+            mock_cmd.side_effect = [
+                server.CommandResult(0, "", ""),  # list vms
+                server.CommandResult(0, "", ""),  # registervm
+                server.CommandResult(0, "", ""),  # modifyvm
+            ]
+            with patch.dict(os.environ, {"VBOX_KALI_CACHE_DIR": tmpdir}, clear=False), patch(
+                "server._download_kali_image",
+                return_value=(dl_archive, "e" * 64, False),
+            ) as mock_dl, patch("server._extract_7z_archive", side_effect=_fake_extract):
+                out_dl = server.provision_kali_vm(
+                    vm_name="Kali-Net",
+                    download=True,
+                    extract_dir=vbox_dir,
+                    take_clean_snapshot=False,
+                )
+            mock_dl.assert_called_once_with(tmpdir, verify_checksum=True, timeout=1800)
+            self.assertIn("SHA-256 verified", out_dl)
+
+            # `.ova` appliance path uses `import` + `modifyvm`.
+            ova_path = os.path.join(tmpdir, "kali.ova")
+            with open(ova_path, "wb") as f:
+                f.write(b"ova")
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, "", ""),  # list vms
+                server.CommandResult(0, "", ""),  # import
+                server.CommandResult(0, "", ""),  # modifyvm
+            ]
+            out_ova = server.provision_kali_vm(
+                vm_name="Kali-OVA", image_path=ova_path, take_clean_snapshot=False
+            )
+            calls_ova = [c.args[0] for c in mock_cmd.call_args_list]
+            self.assertEqual(
+                calls_ova[1],
+                [
+                    "import",
+                    os.path.abspath(ova_path),
+                    "--vsys",
+                    "0",
+                    "--vmname",
+                    "Kali-OVA",
+                    "--vsys",
+                    "0",
+                    "--cpus",
+                    "2",
+                    "--vsys",
+                    "0",
+                    "--memory",
+                    "4096",
+                ],
+            )
+            self.assertEqual(
+                calls_ova[2],
+                ["modifyvm", "Kali-OVA", "--vram", "128", "--nic1", "nat", "--clipboard-mode", "bidirectional"],
+            )
+            self.assertIn("### Provisioned Kali Linux VM: Kali-OVA", out_ova)
+
+            # `VBOX_KALI_BASE_VM` fallback.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, '"Kali-Gold" {9999}', ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+            ]
+            with patch.dict(
+                os.environ, {"VBOX_KALI_BASE_VM": "Kali-Gold", "VBOX_KALI_IMAGE_PATH": ""}, clear=False
+            ):
+                out_env_base = server.provision_kali_vm(
+                    vm_name="Kali-EnvClone", take_clean_snapshot=False
+                )
+            self.assertIn("Linked clone from `Kali-Gold`", out_env_base)
+
+            # `VBOX_KALI_IMAGE_PATH` fallback (with `.vbox` file).
+            env_vbox = os.path.join(tmpdir, "env_kali.vbox")
+            with open(env_vbox, "w", encoding="utf-8") as xf:
+                xf.write('<VirtualBox><Machine uuid="{eeee-5555}" name="KaliEnv" OSType="Debian_64"/></VirtualBox>')
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+            ]
+            with patch.dict(
+                os.environ, {"VBOX_KALI_BASE_VM": "", "VBOX_KALI_IMAGE_PATH": env_vbox}, clear=False
+            ):
+                out_env_img = server.provision_kali_vm(
+                    vm_name="Kali-EnvImg", take_clean_snapshot=False
+                )
+            self.assertIn("Configured VBOX_KALI_IMAGE_PATH", out_env_img)
+
+            # Cached `.7z` in `VBOX_KALI_CACHE_DIR` fallback when no args/env image/base given.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, "", ""),  # list vms
+                server.CommandResult(0, "", ""),  # systemproperties
+                server.CommandResult(0, "", ""),  # registervm
+                server.CommandResult(0, "", ""),  # modifyvm
+            ]
+            cache_extract = os.path.join(tmpdir, "cache_vm_extract")
+            with patch.dict(
+                os.environ,
+                {
+                    "VBOX_KALI_BASE_VM": "",
+                    "VBOX_KALI_IMAGE_PATH": "",
+                    "VBOX_KALI_CACHE_DIR": tmpdir,
+                },
+                clear=False,
+            ), patch("server._extract_7z_archive", side_effect=_fake_extract):
+                out_cached = server.provision_kali_vm(
+                    vm_name="Kali-Cached",
+                    extract_dir=cache_extract,
+                    take_clean_snapshot=False,
+                )
+            self.assertIn("Cached Kali Linux VirtualBox archive", out_cached)
+
+    @patch("server.run_vbox_cmd")
+    def test_provision_kali_vm_guards_collisions_iso_and_missing_source(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        # Duplicate VM name aborts before touching downloads or extraction.
+        mock_cmd.return_value = server.CommandResult(0, '"Kali-Agent" {1111-2222}', "")
+        dup_out = server.provision_kali_vm(vm_name="Kali-Agent", download=True)
+        self.assertIn("already registered", dup_out)
+        mock_cmd.assert_called_once_with(["list", "vms"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # UUID collision on `.vbox` gives actionable `base_vm` / `clone_vm` guidance.
+            vbox_file = os.path.join(tmpdir, "dup.vbox")
+            with open(vbox_file, "w", encoding="utf-8") as xf:
+                xf.write(
+                    '<VirtualBox><Machine uuid="{1111-2222}" name="Kali-Orig" OSType="Debian_64"/></VirtualBox>'
+                )
+            mock_cmd.reset_mock()
+            mock_cmd.return_value = server.CommandResult(0, '"Kali-Orig" {1111-2222}', "")
+            uuid_err = server.provision_kali_vm(vm_name="Kali-Second", image_path=vbox_file)
+            self.assertIn("already registered under VM 'Kali-Orig'", uuid_err)
+            self.assertIn("base_vm='Kali-Orig'", uuid_err)
+            mock_cmd.assert_called_once_with(["list", "vms"])
+
+            # `.iso` directs caller to `create_vm(..., os_type='Debian_64', ...)`.
+            mock_cmd.reset_mock()
+            mock_cmd.return_value = server.CommandResult(0, "", "")
+            iso_err = server.provision_kali_vm(
+                vm_name="Kali-ISO", image_path=os.path.join(tmpdir, "kali-installer.iso")
+            )
+            self.assertIn("os_type='Debian_64'", iso_err)
+
+            # Missing source with `download=False`, no env, and empty cache returns clear instructions.
+            mock_cmd.reset_mock()
+            mock_cmd.return_value = server.CommandResult(0, "", "")
+            with patch.dict(
+                os.environ,
+                {
+                    "VBOX_KALI_BASE_VM": "",
+                    "VBOX_KALI_IMAGE_PATH": "",
+                    "VBOX_KALI_CACHE_DIR": tmpdir,
+                },
+                clear=False,
+            ):
+                missing_err = server.provision_kali_vm(vm_name="Kali-None", download=False)
+            self.assertIn("No Kali Linux provisioning source found", missing_err)
+            self.assertIn("download=True", missing_err)
+
     def test_native_tool_annotations_and_no_monkey_patch(self) -> None:
         self.assertFalse(hasattr(server, "_patched_tool"))
         tools = asyncio.run(server.mcp.list_tools())
-        self.assertEqual(len(tools), 20)
+        self.assertEqual(len(tools), 22)
         by_name = {t.name: t for t in tools}
 
         for ro_name in ("list_vms", "get_vm_info", "get_vm_ip", "list_os_types", "export_vm"):
@@ -876,6 +1530,18 @@ class TestVirtualBoxMCP(unittest.TestCase):
             assert ann is not None
             self.assertFalse(ann.read_only_hint)
             self.assertTrue(ann.destructive_hint)
+
+        reg_ann = by_name["register_vm"].annotations
+        assert reg_ann is not None
+        self.assertFalse(reg_ann.read_only_hint)
+        self.assertFalse(reg_ann.destructive_hint)
+        self.assertFalse(reg_ann.open_world_hint)
+
+        kali_ann = by_name["provision_kali_vm"].annotations
+        assert kali_ann is not None
+        self.assertFalse(kali_ann.read_only_hint)
+        self.assertFalse(kali_ann.destructive_hint)
+        self.assertTrue(kali_ann.open_world_hint)
 
         self.assertTrue(by_name["execute_guest_command"].annotations.open_world_hint)
         resources = asyncio.run(server.mcp.list_resources())

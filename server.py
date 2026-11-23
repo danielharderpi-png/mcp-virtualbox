@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -8,6 +9,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from functools import wraps
@@ -43,7 +48,13 @@ VALID_CLONE_MODES = ("machine", "machineandchildren", "all")
 VALID_NIC_MODES = ("nat", "bridged", "hostonly", "intnet", "none")
 VALID_STORAGE_ACTIONS = ("list", "attach-iso", "eject-iso")
 
+KALI_DEFAULT_IMAGE_BASE_URL = "https://cdimage.kali.org/current/"
+KALI_DEFAULT_VM_NAME = "Kali-Agent"
+KALI_DEFAULT_SNAPSHOT_NAME = "clean-base"
+
 _VM_LINE_RE = re.compile(r'^"(?P<name>.*)"\s+\{(?P<uuid>[^}]+)\}\s*$')
+_KALI_VBOX_7Z_RE = re.compile(r"^kali-linux-[A-Za-z0-9._-]+-virtualbox-amd64\.7z$")
+_SHA256_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+)$")
 
 
 @dataclass
@@ -1857,6 +1868,913 @@ def delete_vm(vm_name: str, delete_files: bool = True, confirm: bool = False) ->
     if delete_files:
         return f"Successfully unregistered and permanently deleted VM '{vm}' and its files."
     return f"Successfully unregistered VM '{vm}' (files preserved on disk)."
+
+
+def _validate_https_url(url: str, field_name: str) -> str:
+    """Validate an HTTPS URL and reject insecure schemes or control characters."""
+    if not isinstance(url, str):
+        raise ValueError(f"{field_name} must be a string.")
+    cleaned = url.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if any(ord(ch) < 32 for ch in cleaned):
+        raise ValueError(f"{field_name} contains invalid control characters.")
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise ValueError(f"{field_name} must be a valid https:// URL.")
+    if parsed.username or parsed.password:
+        raise ValueError(f"{field_name} must not contain embedded credentials.")
+    return cleaned
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects that leave HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        parsed = urllib.parse.urlparse(newurl)
+        if parsed.scheme.lower() != "https":
+            raise urllib.error.URLError(
+                f"Refusing non-HTTPS redirect to '{parsed.scheme or 'unknown'}://'."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _build_https_opener() -> urllib.request.OpenerDirector:
+    """Build a URL opener restricted to HTTPS requests and redirects."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler(),
+        urllib.request.HTTPSHandler(),
+        _HttpsOnlyRedirectHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        urllib.request.UnknownHandler(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+def _parse_kali_sha256sums(content: str) -> tuple[str, str]:
+    """Extract the newest official `kali-linux-*-virtualbox-amd64.7z` entry and SHA-256."""
+    matches: list[tuple[str, str]] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _SHA256_LINE_RE.match(line)
+        if not match:
+            continue
+        digest = match.group(1).lower()
+        filename = match.group(2).strip()
+        if "/" in filename or "\\" in filename or ".." in filename:
+            continue
+        if _KALI_VBOX_7Z_RE.match(filename):
+            matches.append((filename, digest))
+    if not matches:
+        raise ValueError(
+            "No official 'kali-linux-*-virtualbox-amd64.7z' entry found in SHA256SUMS."
+        )
+    matches.sort(key=lambda item: item[0])
+    return matches[-1]
+
+
+def _compute_sha256(file_path: str) -> str:
+    """Compute the lowercase SHA-256 hex digest of a local file."""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
+
+
+def _default_kali_cache_dir() -> str:
+    """Return the cache directory for downloaded Kali VirtualBox archives."""
+    env_dir = os.environ.get("VBOX_KALI_CACHE_DIR", "").strip()
+    if env_dir:
+        return _validate_path_arg(env_dir, "VBOX_KALI_CACHE_DIR")
+    return os.path.join(os.path.expanduser("~"), ".mcp-virtualbox", "kali")
+
+
+def _find_cached_kali_archive(cache_dir: str) -> Optional[str]:
+    """Return the newest non-empty cached Kali VirtualBox `.7z` archive, if present."""
+    if not os.path.isdir(cache_dir):
+        return None
+    matches: list[str] = []
+    for entry in os.listdir(cache_dir):
+        if ".." in entry or not _KALI_VBOX_7Z_RE.match(entry):
+            continue
+        full_path = os.path.join(cache_dir, entry)
+        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+            matches.append(entry)
+    if not matches:
+        return None
+    matches.sort()
+    return os.path.abspath(os.path.join(cache_dir, matches[-1]))
+
+
+def _download_kali_image(
+    cache_dir: str, verify_checksum: bool = True, timeout: int = 1800
+) -> tuple[str, str, bool]:
+    """
+    Download and SHA-256-verify the official pre-built Kali Linux VirtualBox `.7z` image.
+
+    Returns:
+        tuple[str, str, bool]: `(archive_path, sha256_hex, from_cache)`.
+    """
+    raw_base = os.environ.get("VBOX_KALI_IMAGE_BASE_URL", "").strip() or KALI_DEFAULT_IMAGE_BASE_URL
+    base_url = _validate_https_url(raw_base, "VBOX_KALI_IMAGE_BASE_URL")
+    if not base_url.endswith("/"):
+        base_url += "/"
+
+    opener = _build_https_opener()
+    sums_url = urllib.parse.urljoin(base_url, "SHA256SUMS")
+    sums_req = urllib.request.Request(sums_url, headers={"User-Agent": "mcp-virtualbox/2.0"})
+    with opener.open(sums_req, timeout=min(timeout, 60)) as resp:
+        sums_text = resp.read(1024 * 1024).decode("utf-8", errors="replace")
+
+    filename, expected_sha256 = _parse_kali_sha256sums(sums_text)
+    os.makedirs(cache_dir, exist_ok=True)
+    dest_path = os.path.abspath(os.path.join(cache_dir, filename))
+
+    if os.path.isfile(dest_path):
+        if verify_checksum:
+            if _compute_sha256(dest_path) == expected_sha256:
+                return (dest_path, expected_sha256, True)
+        elif os.path.getsize(dest_path) > 0:
+            return (dest_path, expected_sha256, True)
+
+    archive_url = urllib.parse.urljoin(base_url, filename)
+    archive_req = urllib.request.Request(archive_url, headers={"User-Agent": "mcp-virtualbox/2.0"})
+    part_path = f"{dest_path}.part"
+    deadline = time.monotonic() + timeout
+    hasher = hashlib.sha256()
+
+    try:
+        with opener.open(archive_req, timeout=min(timeout, 120)) as resp, open(
+            part_path, "wb"
+        ) as out_file:
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Downloading Kali image '{filename}' exceeded timeout of {timeout}s."
+                    )
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                hasher.update(chunk)
+
+        actual_sha256 = hasher.hexdigest().lower()
+        if verify_checksum and actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"SHA-256 checksum mismatch for '{filename}': "
+                f"expected {expected_sha256}, got {actual_sha256}."
+            )
+        os.replace(part_path, dest_path)
+        return (dest_path, actual_sha256, False)
+    except Exception:
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
+        raise
+
+
+def _find_7z_extractor() -> tuple[str, str]:
+    """Locate an archive extractor capable of unpacking `.7z` archives."""
+    for candidate in ("7z", "7za", "7zz"):
+        hit = shutil.which(candidate)
+        if hit:
+            return ("7z", hit)
+
+    if sys.platform == "win32":
+        for win_candidate in (
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ):
+            if os.path.exists(win_candidate):
+                return ("7z", win_candidate)
+
+    tar_path = shutil.which("tar")
+    if tar_path:
+        proc = subprocess.run(
+            [tar_path, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        version_text = f"{proc.stdout}\n{proc.stderr}".lower()
+        if "bsdtar" in version_text or "libarchive" in version_text:
+            return ("bsdtar", tar_path)
+
+    raise FileNotFoundError(
+        "No .7z extractor found. Install 7-Zip (7z / p7zip-full), or extract the .7z "
+        "archive manually and pass the resulting .vbox file path."
+    )
+
+
+def _validate_archive_members(members: list[str], target_dir: str) -> None:
+    """Validate archive member paths to prevent path traversal and Zip-Slip attacks."""
+    if not members:
+        raise ValueError("Archive contains no files.")
+
+    real_target = os.path.realpath(target_dir)
+    for member in members:
+        if not member or not member.strip() or "\x00" in member:
+            raise ValueError(f"Invalid archive member path: {member!r}")
+        normalized = member.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+            raise ValueError(f"Unsafe absolute archive member path: {member!r}")
+        raw_parts = normalized.split("/")
+        if ".." in raw_parts:
+            raise ValueError(f"Unsafe path traversal in archive member: {member!r}")
+        parts = [part for part in raw_parts if part and part != "."]
+        if parts:
+            resolved = os.path.realpath(os.path.join(real_target, *parts))
+            if os.path.commonpath([real_target, resolved]) != real_target:
+                raise ValueError(f"Archive member escapes target directory: {member!r}")
+
+
+def _list_7z_members(
+    extractor_kind: str, extractor_path: str, archive_path: str, timeout: int
+) -> list[str]:
+    """List member paths inside a `.7z` archive before extracting."""
+    if extractor_kind == "7z":
+        cmd = [extractor_path, "l", "-slt", archive_path]
+    else:
+        cmd = [extractor_path, "-tf", archive_path]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=min(timeout, 120),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Listing archive '{archive_path}' timed out.") from exc
+
+    if proc.returncode != 0:
+        details = proc.stderr.strip() or proc.stdout.strip() or "No details provided."
+        raise RuntimeError(
+            f"Failed to list members of archive '{archive_path}' (exit code {proc.returncode}): {details}"
+        )
+
+    if extractor_kind == "bsdtar":
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    members: list[str] = []
+    in_entries = False
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not in_entries:
+            if re.match(r"^-{5,}$", line):
+                in_entries = True
+            continue
+        if line.startswith("Path = "):
+            member_path = line[len("Path = ") :].strip()
+            if member_path:
+                members.append(member_path)
+    return members
+
+
+def _extract_7z_archive(archive_path: str, target_dir: str, timeout: int = 600) -> str:
+    """Safely inspect and extract a `.7z` archive into `target_dir`."""
+    extractor_kind, extractor_path = _find_7z_extractor()
+    members = _list_7z_members(extractor_kind, extractor_path, archive_path, timeout=timeout)
+    _validate_archive_members(members, target_dir)
+
+    os.makedirs(target_dir, exist_ok=True)
+    if extractor_kind == "7z":
+        cmd = [extractor_path, "x", "-y", f"-o{target_dir}", archive_path]
+    else:
+        cmd = [extractor_path, "-xf", archive_path, "-C", target_dir]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Extracting archive '{archive_path}' timed out after {timeout} seconds."
+        ) from exc
+
+    if proc.returncode != 0:
+        details = proc.stderr.strip() or proc.stdout.strip() or "No error details provided."
+        raise RuntimeError(
+            f"Failed to extract archive '{archive_path}' (exit code {proc.returncode}): {details}"
+        )
+
+    return os.path.abspath(target_dir)
+
+
+def _find_vbox_file(directory: str) -> str:
+    """Locate the single `.vbox` machine definition file inside `directory`."""
+    real_dir = os.path.realpath(directory)
+    matches: list[str] = []
+    for root, _dirs, files in os.walk(directory):
+        for fname in files:
+            if fname.lower().endswith(".vbox"):
+                candidate = os.path.join(root, fname)
+                if os.path.islink(candidate):
+                    raise ValueError(f"Refusing symlinked .vbox file '{candidate}'.")
+                real_candidate = os.path.realpath(candidate)
+                if os.path.commonpath([real_dir, real_candidate]) != real_dir:
+                    raise ValueError(
+                        f"Refusing .vbox file '{candidate}' that resolves outside '{directory}'."
+                    )
+                matches.append(candidate)
+    matches.sort()
+    if not matches:
+        raise ValueError(f"No .vbox machine definition file found inside '{directory}'.")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple .vbox files found inside '{directory}': {', '.join(matches)}. "
+            "Pass the specific .vbox file path directly."
+        )
+    return os.path.abspath(matches[0])
+
+
+def _parse_vbox_metadata(vbox_path: str) -> tuple[str, str, str]:
+    """Parse `(name, uuid, os_type)` from a `.vbox` XML machine definition."""
+    try:
+        tree = ET.parse(vbox_path)
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError(f"Failed to parse .vbox file '{vbox_path}': {exc}") from exc
+
+    machine_elem: Optional[ET.Element] = None
+    for elem in tree.getroot().iter():
+        if elem.tag == "Machine" or elem.tag.endswith("}Machine"):
+            machine_elem = elem
+            break
+
+    if machine_elem is None:
+        raise ValueError(f"No <Machine> element found in .vbox file '{vbox_path}'.")
+
+    name = machine_elem.attrib.get("name", "").strip()
+    uuid = machine_elem.attrib.get("uuid", "").strip().strip("{}")
+    os_type = machine_elem.attrib.get("OSType", "unknown").strip() or "unknown"
+    return (name, uuid, os_type)
+
+
+def _get_default_machine_folder() -> Optional[str]:
+    """Query VirtualBox's configured Default machine folder, if available."""
+    res = run_vbox_cmd(["list", "systemproperties"])
+    if not res.ok:
+        return None
+    for raw_line in res.stdout.splitlines():
+        line = raw_line.strip()
+        if line.lower().startswith("default machine folder:"):
+            folder = line.split(":", 1)[1].strip()
+            return folder or None
+    return None
+
+
+def _get_registered_vms() -> tuple[dict[str, str], dict[str, str]]:
+    """Return `(by_name, by_uuid)` maps for all currently registered VirtualBox VMs."""
+    res = run_vbox_cmd(["list", "vms"])
+    if not res.ok:
+        raise RuntimeError(res.error or "Failed to list registered VMs.")
+    by_name: dict[str, str] = {}
+    by_uuid: dict[str, str] = {}
+    for name, uuid in _parse_vm_entries(res.stdout):
+        by_name[name] = uuid
+        if uuid:
+            by_uuid[uuid.lower()] = name
+    return (by_name, by_uuid)
+
+
+def _build_modifyvm_args(
+    target_vm: str,
+    new_name: Optional[str] = None,
+    cpus: Optional[int] = None,
+    memory_mb: Optional[int] = None,
+    vram_mb: Optional[int] = None,
+    nic_mode: Optional[str] = None,
+    clipboard_mode: Optional[str] = None,
+) -> tuple[list[str], list[str]]:
+    """Build a `VBoxManage modifyvm` command and human-readable change list."""
+    cmd = ["modifyvm", target_vm]
+    changes: list[str] = []
+    if new_name:
+        cmd.extend(["--name", new_name])
+        changes.append(f"name={new_name}")
+    if cpus is not None:
+        cmd.extend(["--cpus", str(cpus)])
+        changes.append(f"cpus={cpus}")
+    if memory_mb is not None:
+        cmd.extend(["--memory", str(memory_mb)])
+        changes.append(f"memory_mb={memory_mb}")
+    if vram_mb is not None:
+        cmd.extend(["--vram", str(vram_mb)])
+        changes.append(f"vram_mb={vram_mb}")
+    if nic_mode is not None:
+        cmd.extend(["--nic1", nic_mode])
+        changes.append(f"nic1={nic_mode}")
+    if clipboard_mode is not None:
+        cmd.extend(["--clipboard-mode", clipboard_mode])
+        changes.append(f"clipboard_mode={clipboard_mode}")
+    return cmd, changes
+
+
+def _resolve_vbox_from_source(
+    abs_source: str, target_dir_for_7z: str, timeout: int
+) -> tuple[str, Optional[str]]:
+    """Resolve a `.vbox` file from a directory, `.vbox` file, or `.7z` archive."""
+    if os.path.isdir(abs_source):
+        return _find_vbox_file(abs_source), None
+    if os.path.isfile(abs_source):
+        lower = abs_source.lower()
+        if lower.endswith(".vbox"):
+            return abs_source, None
+        if lower.endswith(".7z"):
+            if os.path.isdir(target_dir_for_7z) and os.listdir(target_dir_for_7z):
+                raise ValueError(
+                    f"Target extraction directory '{target_dir_for_7z}' already exists and is not empty. "
+                    "Specify a fresh extract_dir or pass the existing .vbox file path directly."
+                )
+            extracted = _extract_7z_archive(abs_source, target_dir_for_7z, timeout=timeout)
+            return _find_vbox_file(extracted), extracted
+    raise ValueError(
+        f"Source path '{abs_source}' must be an existing .vbox file, .7z archive, "
+        "or directory containing a .vbox file."
+    )
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def register_vm(
+    source_path: str,
+    vm_name: str = "",
+    extract_dir: str = "",
+    cpus: Optional[int] = None,
+    memory_mb: Optional[int] = None,
+    vram_mb: Optional[int] = None,
+    nic_mode: Optional[Literal["nat", "bridged", "hostonly", "intnet", "none"]] = None,
+    clipboard_mode: Optional[
+        Literal["disabled", "hosttoguest", "guesttohost", "bidirectional"]
+    ] = None,
+    timeout: int = 600,
+) -> str:
+    """
+    Register a pre-built VM from a `.vbox` file, directory, or `.7z` archive (such as official Kali images).
+
+    Args:
+        source_path (str): Host path to a `.vbox` file, `.7z` archive, or directory containing a `.vbox` file.
+        vm_name (str): Optional new display name to apply via `modifyvm --name` after registering.
+        extract_dir (str): Optional extraction directory when `source_path` is a `.7z` archive.
+        cpus (int, optional): Override vCPU count (1-128).
+        memory_mb (int, optional): Override RAM in MB (128-262144).
+        vram_mb (int, optional): Override video memory in MB (1-256).
+        nic_mode (str, optional): Override NIC 1 mode ("nat", "bridged", "hostonly", "intnet", or "none").
+        clipboard_mode (str, optional): Override clipboard sharing mode.
+        timeout (int): Extraction/registration timeout in seconds (1-3600).
+
+    Returns:
+        str: Markdown summary of the registered VM or error details.
+    """
+    try:
+        src = _validate_path_arg(source_path, "source_path")
+        valid_name = _validate_identifier(vm_name, "vm_name") if vm_name.strip() else ""
+        dest_dir = _validate_path_arg(extract_dir, "extract_dir") if extract_dir.strip() else ""
+        valid_cpus = _validate_int_range(cpus, "cpus", 1, 128) if cpus is not None else None
+        valid_mem = (
+            _validate_int_range(memory_mb, "memory_mb", 128, 262144)
+            if memory_mb is not None
+            else None
+        )
+        valid_vram = _validate_int_range(vram_mb, "vram_mb", 1, 256) if vram_mb is not None else None
+        valid_timeout = _validate_int_range(timeout, "timeout", 1, 3600)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if nic_mode is not None and nic_mode not in VALID_NIC_MODES:
+        return f"Error: Invalid nic_mode '{nic_mode}'. Must be one of {list(VALID_NIC_MODES)}."
+    if clipboard_mode is not None and clipboard_mode not in VALID_CLIPBOARD_MODES:
+        return (
+            f"Error: Invalid clipboard_mode '{clipboard_mode}'. "
+            f"Must be one of {list(VALID_CLIPBOARD_MODES)}."
+        )
+
+    abs_source = os.path.abspath(src)
+    default_7z_dir = os.path.join(
+        os.path.dirname(abs_source),
+        os.path.splitext(os.path.basename(abs_source))[0],
+    )
+    target_7z_dir = os.path.abspath(dest_dir) if dest_dir else default_7z_dir
+
+    try:
+        vbox_file, extracted_dir = _resolve_vbox_from_source(
+            abs_source, target_7z_dir, timeout=valid_timeout
+        )
+        orig_name, machine_uuid, os_type = _parse_vbox_metadata(vbox_file)
+        target_ref = _validate_identifier(machine_uuid or orig_name, "machine identifier")
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return f"Error: {exc}"
+
+    reg_res = run_vbox_cmd(["registervm", vbox_file], timeout=min(valid_timeout, 120))
+    if not reg_res.ok:
+        err_text = reg_res.error or "Unknown registration error."
+        hint = ""
+        if "already exists" in err_text.lower():
+            hint = (
+                " Hint: A VM or disk with the same UUID/name is already registered; "
+                "use `clone_vm` or `provision_kali_vm(base_vm=...)` to create a separate copy."
+            )
+        return f"Error: Failed to register VM from '{vbox_file}': {err_text}{hint}"
+
+    modify_cmd, changes = _build_modifyvm_args(
+        target_ref,
+        new_name=valid_name if (valid_name and valid_name != orig_name) else None,
+        cpus=valid_cpus,
+        memory_mb=valid_mem,
+        vram_mb=valid_vram,
+        nic_mode=nic_mode,
+        clipboard_mode=clipboard_mode,
+    )
+    if changes:
+        mod_res = run_vbox_cmd(modify_cmd)
+        if not mod_res.ok:
+            return (
+                f"Error: VM '{orig_name or target_ref}' was registered from '{vbox_file}', "
+                f"but applying customizations failed: {mod_res.error}"
+            )
+
+    final_name = valid_name or orig_name or os.path.splitext(os.path.basename(vbox_file))[0]
+    lines = [
+        f"### Registered VM: {final_name}",
+        f"- **UUID:** `{machine_uuid or 'unknown'}`",
+        f"- **OS Type:** `{os_type}`",
+        f"- **Definition File:** `{vbox_file}`",
+    ]
+    if extracted_dir:
+        lines.append(f"- **Extracted Directory:** `{extracted_dir}`")
+    if changes:
+        lines.append(f"- **Customizations Applied:** {', '.join(changes)}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+@tool_guard
+def provision_kali_vm(
+    vm_name: str = KALI_DEFAULT_VM_NAME,
+    image_path: str = "",
+    download: bool = False,
+    base_vm: str = "",
+    base_snapshot: str = "",
+    linked_clone: bool = True,
+    extract_dir: str = "",
+    cpus: int = 2,
+    memory_mb: int = 4096,
+    vram_mb: int = 128,
+    nic_mode: Literal["nat", "bridged", "hostonly", "intnet", "none"] = "nat",
+    clipboard_mode: Literal[
+        "disabled", "hosttoguest", "guesttohost", "bidirectional"
+    ] = "bidirectional",
+    take_clean_snapshot: bool = True,
+    snapshot_name: str = KALI_DEFAULT_SNAPSHOT_NAME,
+    start_vm: bool = False,
+    start_mode: Literal["headless", "gui", "separate"] = "headless",
+    verify_checksum: bool = True,
+    timeout: int = 1800,
+) -> str:
+    """
+    Provision a ready-to-use Kali Linux VM for the agent from a pre-built image or Kali base VM.
+
+    Supports official Kali VirtualBox `.7z` archives (including optional verified HTTPS download from
+    `cdimage.kali.org/current/`), extracted `.vbox` directories/files, `.ova`/`.ovf` appliances,
+    and fast linked/full clones from an existing Kali base VM.
+
+    Args:
+        vm_name (str): Name for the new Kali VM (default "Kali-Agent").
+        image_path (str): Optional local `.7z`, `.vbox`, extracted VM dir, or `.ova`/`.ovf`.
+        download (bool): Download & SHA-256-verify the official pre-built Kali VirtualBox `.7z`.
+        base_vm (str): Existing registered Kali template VM to clone from.
+        base_snapshot (str): Snapshot on `base_vm` (defaults to "clean-base" when `linked_clone=True`).
+        linked_clone (bool): Use a fast linked clone when cloning from `base_vm`.
+        extract_dir (str): Optional target directory when extracting a `.7z` image.
+        cpus (int): Virtual CPU count (1-128, default 2).
+        memory_mb (int): Base RAM in MB (128-262144, default 4096).
+        vram_mb (int): Video memory in MB (1-256, default 128).
+        nic_mode (str): NIC 1 mode ("nat", "bridged", "hostonly", "intnet", or "none").
+        clipboard_mode (str): Guest clipboard sharing mode (default "bidirectional").
+        take_clean_snapshot (bool): Create an initial baseline snapshot after provisioning.
+        snapshot_name (str): Name of the baseline snapshot (default "clean-base").
+        start_vm (bool): Boot the provisioned Kali VM immediately after setup.
+        start_mode (str): Boot mode when `start_vm=True` ("headless", "gui", or "separate").
+        verify_checksum (bool): Verify official `SHA256SUMS` digest when downloading.
+        timeout (int): Maximum operation timeout in seconds (1-3600).
+
+    Returns:
+        str: Markdown summary with Kali VM details, snapshot state, and credential guidance.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        valid_cpus = _validate_int_range(cpus, "cpus", 1, 128)
+        valid_mem = _validate_int_range(memory_mb, "memory_mb", 128, 262144)
+        valid_vram = _validate_int_range(vram_mb, "vram_mb", 1, 256)
+        valid_timeout = _validate_int_range(timeout, "timeout", 1, 3600)
+        valid_snap = (
+            _validate_identifier(snapshot_name, "snapshot_name") if take_clean_snapshot else ""
+        )
+        valid_image = _validate_path_arg(image_path, "image_path") if image_path.strip() else ""
+        valid_base_vm = _validate_identifier(base_vm, "base_vm") if base_vm.strip() else ""
+        valid_base_snap = (
+            _validate_identifier(base_snapshot, "base_snapshot") if base_snapshot.strip() else ""
+        )
+        valid_extract_dir = (
+            _validate_path_arg(extract_dir, "extract_dir") if extract_dir.strip() else ""
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if nic_mode not in VALID_NIC_MODES:
+        return f"Error: Invalid nic_mode '{nic_mode}'. Must be one of {list(VALID_NIC_MODES)}."
+    if clipboard_mode not in VALID_CLIPBOARD_MODES:
+        return (
+            f"Error: Invalid clipboard_mode '{clipboard_mode}'. "
+            f"Must be one of {list(VALID_CLIPBOARD_MODES)}."
+        )
+    if start_mode not in VALID_START_MODES:
+        return f"Error: Invalid start_mode '{start_mode}'. Must be one of {list(VALID_START_MODES)}."
+
+    try:
+        by_name, by_uuid = _get_registered_vms()
+    except RuntimeError as exc:
+        return f"Error: {exc}"
+
+    if vm in by_name:
+        existing_uuid = by_name[vm] or "unknown"
+        return (
+            f"Error: VM '{vm}' is already registered (UUID: {existing_uuid}). "
+            "Choose a different vm_name or manage the existing VM."
+        )
+
+    flow_mode = ""
+    resolved_image = ""
+    resolved_base = ""
+    source_desc = ""
+    machine_uuid = ""
+    os_type = "Debian_64"
+
+    if valid_image:
+        flow_mode = "image"
+        resolved_image = valid_image
+        source_desc = f"Local image (`{os.path.abspath(valid_image)}`)"
+    elif valid_base_vm:
+        flow_mode = "clone"
+        resolved_base = valid_base_vm
+    elif download:
+        try:
+            cache_dir = _default_kali_cache_dir()
+            downloaded_path, actual_sha, from_cache = _download_kali_image(
+                cache_dir, verify_checksum=verify_checksum, timeout=valid_timeout
+            )
+        except (ValueError, TimeoutError, urllib.error.URLError, OSError) as exc:
+            return f"Error: Failed to download Kali Linux image: {exc}"
+
+        flow_mode = "image"
+        resolved_image = downloaded_path
+        cache_note = "reused verified cached archive" if from_cache else "downloaded"
+        sha_note = (
+            f"SHA-256 verified (`{actual_sha}`)"
+            if verify_checksum
+            else f"SHA-256 `{actual_sha}` (checksum verification disabled)"
+        )
+        source_desc = (
+            f"Official Kali Linux VirtualBox archive (`{os.path.basename(downloaded_path)}`, "
+            f"{cache_note}; {sha_note})"
+        )
+    else:
+        env_base = os.environ.get("VBOX_KALI_BASE_VM", "").strip()
+        env_img = os.environ.get("VBOX_KALI_IMAGE_PATH", "").strip()
+        if env_base:
+            try:
+                resolved_base = _validate_identifier(env_base, "VBOX_KALI_BASE_VM")
+            except ValueError as exc:
+                return f"Error: {exc}"
+            flow_mode = "clone"
+        elif env_img:
+            try:
+                resolved_image = _validate_path_arg(env_img, "VBOX_KALI_IMAGE_PATH")
+            except ValueError as exc:
+                return f"Error: {exc}"
+            flow_mode = "image"
+            source_desc = f"Configured VBOX_KALI_IMAGE_PATH (`{os.path.abspath(resolved_image)}`)"
+        else:
+            try:
+                cache_dir = _default_kali_cache_dir()
+            except ValueError as exc:
+                return f"Error: {exc}"
+            cached_archive = _find_cached_kali_archive(cache_dir)
+            if cached_archive:
+                flow_mode = "image"
+                resolved_image = cached_archive
+                source_desc = f"Cached Kali Linux VirtualBox archive (`{cached_archive}`)"
+
+    if not flow_mode:
+        return (
+            "Error: No Kali Linux provisioning source found. Supply one of:\n"
+            "1. `download=True` to download & SHA-256-verify the official pre-built Kali VirtualBox `.7z` image;\n"
+            "2. `image_path='/path/to/kali-linux-*-virtualbox-amd64.7z'` (or `.vbox` / extracted dir / `.ova`), "
+            "or set `VBOX_KALI_IMAGE_PATH`;\n"
+            "3. `base_vm='<existing-kali-vm>'` (or set `VBOX_KALI_BASE_VM`) to clone an existing Kali template VM."
+        )
+
+    if flow_mode == "clone":
+        clone_cmd = ["clonevm", resolved_base, "--name", vm, "--mode", "machine", "--register"]
+        if linked_clone:
+            eff_snap = valid_base_snap or KALI_DEFAULT_SNAPSHOT_NAME
+            clone_cmd.extend(["--snapshot", eff_snap, "--options", "link"])
+            source_desc = f"Linked clone from `{resolved_base}` (snapshot `{eff_snap}`)"
+        elif valid_base_snap:
+            clone_cmd.extend(["--snapshot", valid_base_snap])
+            source_desc = f"Full clone from `{resolved_base}` (snapshot `{valid_base_snap}`)"
+        else:
+            source_desc = f"Full clone from `{resolved_base}`"
+
+        clone_res = run_vbox_cmd(clone_cmd, timeout=min(valid_timeout, 600))
+        if not clone_res.ok:
+            return f"Error: Failed to clone Kali base VM '{resolved_base}' to '{vm}': {clone_res.error}"
+
+        mod_cmd, _ = _build_modifyvm_args(
+            vm,
+            cpus=valid_cpus,
+            memory_mb=valid_mem,
+            vram_mb=valid_vram,
+            nic_mode=nic_mode,
+            clipboard_mode=clipboard_mode,
+        )
+        mod_res = run_vbox_cmd(mod_cmd)
+        if not mod_res.ok:
+            return (
+                f"Error: Cloned Kali VM '{vm}', but applying resource settings failed: "
+                f"{mod_res.error}"
+            )
+    else:
+        abs_image = os.path.abspath(resolved_image)
+        lower_image = abs_image.lower()
+
+        if lower_image.endswith(".iso"):
+            return (
+                f"Error: '{abs_image}' is an installer ISO, whereas `provision_kali_vm` uses "
+                "pre-built Kali VirtualBox images (`.7z`, `.vbox`, extracted VM directory, or `.ova`/`.ovf`) "
+                "with Guest Additions pre-installed. For a manual ISO install, call "
+                f"`create_vm(vm_name='{vm}', os_type='Debian_64', disk_size_mb=40960, iso_path='{abs_image}')`."
+            )
+
+        if lower_image.endswith((".ova", ".ovf")):
+            if not os.path.isfile(abs_image):
+                return f"Error: Appliance file '{abs_image}' does not exist."
+            import_cmd = [
+                "import",
+                abs_image,
+                "--vsys",
+                "0",
+                "--vmname",
+                vm,
+                "--vsys",
+                "0",
+                "--cpus",
+                str(valid_cpus),
+                "--vsys",
+                "0",
+                "--memory",
+                str(valid_mem),
+            ]
+            imp_res = run_vbox_cmd(import_cmd, timeout=min(valid_timeout, 600))
+            if not imp_res.ok:
+                return f"Error: Failed to import Kali appliance '{abs_image}': {imp_res.error}"
+
+            mod_cmd, _ = _build_modifyvm_args(
+                vm,
+                vram_mb=valid_vram,
+                nic_mode=nic_mode,
+                clipboard_mode=clipboard_mode,
+            )
+            mod_res = run_vbox_cmd(mod_cmd)
+            if not mod_res.ok:
+                return (
+                    f"Error: Imported Kali VM '{vm}', but network/display configuration failed: "
+                    f"{mod_res.error}"
+                )
+        else:
+            target_7z_dir = ""
+            if os.path.isfile(abs_image) and lower_image.endswith(".7z"):
+                if valid_extract_dir:
+                    target_7z_dir = os.path.abspath(valid_extract_dir)
+                else:
+                    default_folder = _get_default_machine_folder()
+                    if default_folder:
+                        target_7z_dir = os.path.join(default_folder, vm)
+                    else:
+                        target_7z_dir = os.path.join(os.path.dirname(abs_image), vm)
+
+            try:
+                vbox_file, _ = _resolve_vbox_from_source(
+                    abs_image, target_7z_dir, timeout=valid_timeout
+                )
+                orig_name, machine_uuid, os_type = _parse_vbox_metadata(vbox_file)
+                target_ref = _validate_identifier(machine_uuid or orig_name, "machine identifier")
+            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+                return f"Error: {exc}"
+
+            if machine_uuid and machine_uuid.lower() in by_uuid:
+                existing_vm = by_uuid[machine_uuid.lower()]
+                return (
+                    f"Error: The .vbox machine UUID '{machine_uuid}' is already registered under "
+                    f"VM '{existing_vm}'. VirtualBox cannot register the same VM/VDI UUIDs twice. "
+                    f"Use `provision_kali_vm(vm_name='{vm}', base_vm='{existing_vm}', linked_clone=True)` "
+                    "or `clone_vm` to create an independent Kali VM with fresh UUIDs."
+                )
+
+            reg_res = run_vbox_cmd(["registervm", vbox_file], timeout=min(valid_timeout, 120))
+            if not reg_res.ok:
+                return f"Error: Failed to register Kali VM from '{vbox_file}': {reg_res.error}"
+
+            mod_cmd, _ = _build_modifyvm_args(
+                target_ref,
+                new_name=vm if vm != orig_name else None,
+                cpus=valid_cpus,
+                memory_mb=valid_mem,
+                vram_mb=valid_vram,
+                nic_mode=nic_mode,
+                clipboard_mode=clipboard_mode,
+            )
+            mod_res = run_vbox_cmd(mod_cmd)
+            if not mod_res.ok:
+                return (
+                    f"Error: Registered Kali VM '{orig_name or target_ref}' from '{vbox_file}', "
+                    f"but configuration failed: {mod_res.error}"
+                )
+
+    snapshot_status = "Skipped"
+    if take_clean_snapshot:
+        snap_res = run_vbox_cmd(
+            ["snapshot", vm, "take", valid_snap, "--description", "Clean Kali Linux agent baseline"],
+            timeout=120,
+        )
+        if not snap_res.ok:
+            return (
+                f"Error: Provisioned Kali VM '{vm}', but creating baseline snapshot "
+                f"'{valid_snap}' failed: {snap_res.error}"
+            )
+        snapshot_status = f"`{valid_snap}` (created)"
+
+    power_status = "STOPPED"
+    if start_vm:
+        start_res = run_vbox_cmd(["startvm", vm, "--type", start_mode])
+        if not start_res.ok:
+            return f"Error: Provisioned Kali VM '{vm}', but starting it failed: {start_res.error}"
+        power_status = f"RUNNING (`{start_mode}`)"
+
+    lines = [
+        f"### Provisioned Kali Linux VM: {vm}",
+        f"- **Source:** {source_desc}",
+    ]
+    if machine_uuid:
+        lines.append(f"- **UUID:** `{machine_uuid}`")
+    lines.extend(
+        [
+            f"- **OS Type:** `{os_type}`",
+            f"- **Resources:** {valid_cpus} vCPU(s), {valid_mem} MB RAM, {valid_vram} MB VRAM",
+            f"- **NIC 1:** `{nic_mode}` | **Clipboard:** `{clipboard_mode}`",
+            f"- **Baseline Snapshot:** {snapshot_status}",
+            f"- **Power State:** {power_status}",
+            (
+                "- **Default Credentials Note:** Fresh official Kali pre-built VirtualBox images "
+                "use username `kali` / password `kali` with Guest Additions pre-installed. "
+                "Rotate the default password on first boot (or create a dedicated low-privilege user) "
+                "and configure `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD`."
+            ),
+            (
+                f"- **Fast Reuse Tip:** Spin up additional disposable Kali VMs quickly via "
+                f"`provision_kali_vm(vm_name='<new-name>', base_vm='{vm}', linked_clone=True)`."
+            ),
+        ]
+    )
+    return "\n".join(lines)
 
 
 @mcp.resource("vbox://vms")

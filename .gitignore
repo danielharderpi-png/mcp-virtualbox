@@ -56,3 +56,29 @@ env/
 .idea/
 *.swp
 *.swo
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# VirtualBox / Kali VM images, disks, and local caches
+.mcp-virtualbox/
+*.vdi
+*.vmdk
+*.vhd
+*.vhdx
+*.vbox
+*.vbox-prev
+*.ova
+*.ovf
+*.iso
+*.7z
+*.part
+
+# OS and log files
+.DS_Store
+Thumbs.db
+*.log

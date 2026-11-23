@@ -6,7 +6,7 @@ Spin up headless sandboxes, snapshot state before risky changes, discover guest 
 
 ## Features
 
-- **20 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle (creation, unattended OS install, cloning, `.ova`/`.ovf` import/export, guarded deletion), snapshots, storage/ISO control, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, IP discovery, and screenshots.
+- **22 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle (Kali Linux agent VM provisioning, `.vbox`/`.7z` registration, VM creation, unattended OS install, cloning, `.ova`/`.ovf` import/export, guarded deletion), snapshots, storage/ISO control, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, IP discovery, and screenshots.
 - **Native MCP Tool Annotations:** Accurate `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` hints so MCP clients know which operations mutate state.
 - **Credential Redaction & Env Fallbacks:** Passwords (`--password` / `--password-file`) are automatically scrubbed from error messages and logs, and can be supplied via `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` so credentials never appear in chat history.
 - **CLI Flag-Injection & Bounds Validation:** Rejects invalid/flag-prefixed identifiers (`--...`), validates port/resource ranges, and runs `VBoxManage` without `shell=True`.
@@ -79,6 +79,10 @@ Add the server to your MCP client configuration (Claude Desktop, Cline, Cursor, 
 | `VBOX_REQUIRE_STRICT_AUTH` | `false` | Set to `true` to require `VBOX_API_TOKEN`. |
 | `VBOX_API_TOKEN` | *(none)* | Token checked when `VBOX_REQUIRE_STRICT_AUTH=true`. |
 | `VBOX_LOG_LEVEL` | `WARNING` | `stderr` log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+| `VBOX_KALI_IMAGE_PATH` | *(none)* | Default local `.7z`, `.vbox`, extracted directory, or `.ova`/`.ovf` used by `provision_kali_vm`. |
+| `VBOX_KALI_BASE_VM` | *(none)* | Existing Kali template VM name/UUID used for cloning when `provision_kali_vm` runs without explicit source. |
+| `VBOX_KALI_CACHE_DIR` | `~/.mcp-virtualbox/kali` | Directory where downloaded official Kali VirtualBox `.7z` archives are cached. |
+| `VBOX_KALI_IMAGE_BASE_URL` | `https://cdimage.kali.org/current/` | HTTPS base URL hosting `SHA256SUMS` and official Kali VirtualBox `.7z` images. |
 
 ## Tool Reference
 
@@ -101,11 +105,28 @@ Add the server to your MCP client configuration (Claude Desktop, Cline, Cursor, 
 | `create_vm` | Create and register a new VM with CPUs, RAM, VRAM, NIC mode, VDI disk, and optional ISO. | Mutating |
 | `unattended_install` | Configure hands-free OS installation from an ISO with Guest Additions support. | Destructive |
 | `import_vm` | Import a pre-built `.ova` or `.ovf` appliance (supports `dry_run` and overrides). | Mutating |
+| `register_vm` | Register an existing `.vbox` file, VM directory, or `.7z` VirtualBox archive with optional overrides. | Mutating |
+| `provision_kali_vm` | Provision a Kali Linux agent VM from an official `.7z`/`.vbox`/`.ova` image (with optional verified HTTPS download) or clone an existing Kali VM. | Mutating, Open-world |
 | `export_vm` | Export a stopped VM into an `.ova` or `.ovf` appliance archive. | Read-only, Idempotent |
 | `manage_storage` | `list` controllers/attached media, `attach-iso`, or `eject-iso` on virtual DVD drives. | Idempotent |
 | `delete_vm` | Guarded VM teardown (`confirm=True` required; optionally removes disk files). | Destructive |
 
 **Resource:** `vbox://vms` exposes the registered VM inventory directly as an MCP resource.
+
+### Kali Linux Agent VM Setup
+
+Official pre-built Kali Linux VirtualBox images come with Guest Additions pre-installed and default credentials `kali` / `kali`.
+
+1. **First-time provisioning** (downloads & SHA-256-verifies the official `.7z` archive, extracts it, registers the `.vbox`, sets 2 vCPUs / 4096 MB RAM / 128 MB VRAM, and takes a `clean-base` snapshot):
+   ```text
+   provision_kali_vm(vm_name="Kali-Agent", download=True, start_vm=True)
+   ```
+   *(Or pass a local archive/folder directly with `image_path="/path/to/kali-linux-*-virtualbox-amd64.7z"`, or set `VBOX_KALI_IMAGE_PATH`.)*
+2. **Fast linked-clone reuse** for additional disposable agent VMs:
+   ```text
+   provision_kali_vm(vm_name="Kali-Sandbox-1", base_vm="Kali-Agent", linked_clone=True, start_vm=True)
+   ```
+3. **Credential hygiene:** On first boot, rotate the default `kali` password (or create a dedicated low-privilege guest user) and store those credentials in `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD`.
 
 ## Security Best Practices
 
