@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import re
@@ -46,7 +47,59 @@ VALID_FOLDER_ACTIONS = ("list", "add", "remove")
 VALID_CLIPBOARD_MODES = ("disabled", "hosttoguest", "guesttohost", "bidirectional")
 VALID_CLONE_MODES = ("machine", "machineandchildren", "all")
 VALID_NIC_MODES = ("nat", "bridged", "hostonly", "intnet", "none")
+VALID_NIC_ATTACHMENTS = ("nat", "natnetwork", "intnet", "hostonly", "bridged", "none")
+VALID_NIC_ADAPTER_ACTIONS = ("list", "configure")
+VALID_PROMISC_MODES = ("deny", "allow-vms", "allow-all")
+VALID_NAT_NET_ACTIONS = ("list", "add", "modify", "remove", "start", "stop")
+VALID_CAPTURE_ACTIONS = ("status", "start", "stop")
+VALID_HOSTONLY_ACTIONS = (
+    "list",
+    "create",
+    "configure",
+    "remove",
+    "dhcp-configure",
+    "dhcp-remove",
+)
+VALID_METRICS_ACTIONS = ("setup", "query", "disable")
+VALID_DISK_ACTIONS = ("list", "create", "clone", "set-type", "attach", "detach")
+VALID_DISK_FORMATS = ("VDI", "VMDK", "VHD")
+VALID_DISK_TYPES = ("normal", "immutable", "readonly", "writethrough", "multiattach")
+VALID_RANGE_SNAPSHOT_ACTIONS = ("snapshot", "revert")
 VALID_STORAGE_ACTIONS = ("list", "attach-iso", "eject-iso")
+
+_KEY_SCANCODES: dict[str, list[str]] = {
+    "ESC": ["01", "81"],
+    "BACKSPACE": ["0e", "8e"],
+    "TAB": ["0f", "8f"],
+    "ENTER": ["1c", "9c"],
+    "SPACE": ["39", "b9"],
+    "UP": ["e0", "48", "e0", "c8"],
+    "DOWN": ["e0", "50", "e0", "d0"],
+    "LEFT": ["e0", "4b", "e0", "cb"],
+    "RIGHT": ["e0", "4d", "e0", "cd"],
+    "HOME": ["e0", "47", "e0", "c7"],
+    "END": ["e0", "4f", "e0", "cf"],
+    "PAGEUP": ["e0", "49", "e0", "c9"],
+    "PAGEDOWN": ["e0", "51", "e0", "d1"],
+    "DELETE": ["e0", "53", "e0", "d3"],
+    "F1": ["3b", "bb"],
+    "F2": ["3c", "bc"],
+    "F3": ["3d", "bd"],
+    "F4": ["3e", "be"],
+    "F5": ["3f", "bf"],
+    "F6": ["40", "c0"],
+    "F7": ["41", "c1"],
+    "F8": ["42", "c2"],
+    "F9": ["43", "c3"],
+    "F10": ["44", "c4"],
+    "F11": ["57", "d7"],
+    "F12": ["58", "d8"],
+    "CTRL_C": ["1d", "2e", "ae", "9d"],
+    "CTRL_D": ["1d", "20", "a0", "9d"],
+    "CTRL_Z": ["1d", "2c", "ac", "9d"],
+    "CTRL_ALT_DEL": ["1d", "38", "e0", "53", "e0", "d3", "b8", "9d"],
+    "ALT_F4": ["38", "3e", "be", "b8"],
+}
 
 KALI_DEFAULT_IMAGE_BASE_URL = "https://cdimage.kali.org/current/"
 KALI_DEFAULT_VM_NAME = "Kali-Agent"
@@ -2775,6 +2828,1354 @@ def provision_kali_vm(
         ]
     )
     return "\n".join(lines)
+
+
+def _validate_ipv4_cidr(cidr: str, field_name: str = "cidr") -> str:
+    """Validate an IPv4 CIDR network block (e.g., '10.10.0.0/24')."""
+    if not isinstance(cidr, str):
+        raise ValueError(f"{field_name} must be a string (e.g., '10.10.0.0/24').")
+    cleaned = cidr.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if cleaned.startswith("-"):
+        raise ValueError(f"{field_name} cannot start with '-'.")
+    try:
+        net = ipaddress.IPv4Network(cleaned, strict=True)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {field_name} '{cleaned}': {exc}") from exc
+    return str(net)
+
+
+def _validate_mac_address(mac: str) -> str:
+    """Validate a VirtualBox MAC address ('auto' or 12 hex digits, with optional ':'/'-')."""
+    if not isinstance(mac, str):
+        raise ValueError("mac_address must be a string ('auto' or 12 hex digits).")
+    cleaned = mac.strip()
+    if not cleaned:
+        raise ValueError("mac_address cannot be empty.")
+    if cleaned.lower() == "auto":
+        return "auto"
+    compact = cleaned.replace(":", "").replace("-", "")
+    if not re.fullmatch(r"[0-9A-Fa-f]{12}", compact):
+        raise ValueError(
+            "mac_address must be 'auto' or 12 hexadecimal digits (e.g., '080027112233' or '08:00:27:11:22:33')."
+        )
+    return compact.upper()
+
+
+def _format_nic_summary(parsed: dict[str, str]) -> list[str]:
+    """Extract formatted per-NIC adapter lines from machinereadable VM info."""
+    lines: list[str] = []
+    for idx in range(1, 9):
+        mode = parsed.get(f"nic{idx}", "")
+        if not mode or mode == "none":
+            continue
+        details: list[str] = [f"mode=`{mode}`"]
+        net_key_map = {
+            "natnetwork": f"natnet{idx}",
+            "intnet": f"intnet{idx}",
+            "hostonly": f"hostonlyadapter{idx}",
+            "bridged": f"bridgeadapter{idx}",
+        }
+        net_key = net_key_map.get(mode)
+        if net_key and parsed.get(net_key):
+            details.append(f"network=`{parsed[net_key]}`")
+        cable = parsed.get(f"cableconnected{idx}")
+        if cable:
+            details.append(f"cable=`{cable}`")
+        promisc = parsed.get(f"nicpromisc{idx}")
+        if promisc:
+            details.append(f"promisc=`{promisc}`")
+        mac = parsed.get(f"macaddress{idx}")
+        if mac:
+            details.append(f"mac=`{mac}`")
+        trace = parsed.get(f"nictrace{idx}")
+        if trace == "on":
+            trace_file = parsed.get(f"nictracefile{idx}", "")
+            details.append(f"pcap=`on` ({trace_file})" if trace_file else "pcap=`on`")
+        lines.append(f"- **NIC {idx}:** " + ", ".join(details))
+    return lines
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_network_adapters(
+    vm_name: str,
+    action: Literal["list", "configure"] = "list",
+    adapter: int = 1,
+    attachment: Optional[
+        Literal["nat", "natnetwork", "intnet", "hostonly", "bridged", "none"]
+    ] = None,
+    network_name: Optional[str] = None,
+    cable_connected: Optional[bool] = None,
+    promisc_mode: Optional[Literal["deny", "allow-vms", "allow-all"]] = None,
+    mac_address: Optional[str] = None,
+) -> str:
+    """
+    List or configure VirtualBox network adapters (NIC 1-8) on a VM.
+
+    Supports switching between `nat`, `natnetwork`, `intnet` (Internal Network),
+    `hostonly`, `bridged`, and `none` (air-gapped), toggling virtual cable state,
+    setting promiscuous mode, and assigning MAC addresses. Automatically uses
+    `controlvm` when the VM is running/paused and `modifyvm` when stopped.
+
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        action (str): "list" to inspect adapters, or "configure" to update a NIC.
+        adapter (int): VirtualBox NIC index (1-8, default 1).
+        attachment (str, optional): Attachment mode ("nat", "natnetwork", "intnet", "hostonly", "bridged", "none").
+        network_name (str, optional): Target network/interface name (required for "natnetwork", "intnet", "hostonly", "bridged").
+        cable_connected (bool, optional): Connect (True) or unplug (False) the virtual network cable.
+        promisc_mode (str, optional): Promiscuous mode ("deny", "allow-vms", "allow-all").
+        mac_address (str, optional): Custom MAC address (12 hex digits or "auto"; stopped VMs only).
+
+    Returns:
+        str: Adapter listing or confirmation of applied changes.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        nic = _validate_int_range(adapter, "adapter", 1, 8)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action not in VALID_NIC_ADAPTER_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_NIC_ADAPTER_ACTIONS)}."
+        )
+
+    info_res = run_vbox_cmd(["showvminfo", vm, "--machinereadable"])
+    if not info_res.ok:
+        return f"Error: Failed to inspect network adapters for VM '{vm}': {info_res.error}"
+    parsed = parse_machinereadable(info_res.stdout)
+    vm_state = parsed.get("VMState", "unknown").lower()
+
+    if action == "list":
+        nic_lines = _format_nic_summary(parsed)
+        if not nic_lines:
+            return f"No active network adapters configured on VM '{vm}' (state: `{vm_state}`)."
+        return (
+            f"### Network Adapters for VM: {vm} (state: `{vm_state}`)\n"
+            + "\n".join(nic_lines)
+        )
+
+    if (
+        attachment is None
+        and network_name is None
+        and cable_connected is None
+        and promisc_mode is None
+        and mac_address is None
+    ):
+        return (
+            "Error: Provide at least one setting to configure "
+            "(attachment, network_name, cable_connected, promisc_mode, or mac_address)."
+        )
+
+    if attachment is not None and attachment not in VALID_NIC_ATTACHMENTS:
+        return (
+            f"Error: Invalid attachment '{attachment}'. "
+            f"Must be one of {list(VALID_NIC_ATTACHMENTS)}."
+        )
+
+    if promisc_mode is not None and promisc_mode not in VALID_PROMISC_MODES:
+        return (
+            f"Error: Invalid promisc_mode '{promisc_mode}'. "
+            f"Must be one of {list(VALID_PROMISC_MODES)}."
+        )
+
+    valid_net_name: Optional[str] = None
+    if network_name is not None:
+        try:
+            valid_net_name = _validate_identifier(network_name, "network_name")
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    valid_mac: Optional[str] = None
+    if mac_address is not None:
+        try:
+            valid_mac = _validate_mac_address(mac_address)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    named_attachments = ("natnetwork", "intnet", "hostonly", "bridged")
+    effective_attachment = attachment if attachment is not None else parsed.get(f"nic{nic}", "")
+    if attachment in named_attachments and not valid_net_name:
+        return (
+            f"Error: network_name is required when attachment is '{attachment}'."
+        )
+    if valid_net_name and effective_attachment not in named_attachments:
+        return (
+            f"Error: network_name cannot be set for attachment mode '{effective_attachment or 'none'}'. "
+            f"Specify attachment as one of {list(named_attachments)}."
+        )
+
+    is_live = vm_state in ("running", "paused")
+    changes: list[str] = []
+
+    if is_live:
+        if valid_mac is not None:
+            return (
+                f"Error: Cannot change mac_address on VM '{vm}' while it is '{vm_state}'. "
+                "Power off the VM first."
+            )
+
+        live_cmds: list[tuple[str, list[str]]] = []
+        if attachment is not None or valid_net_name is not None:
+            target = effective_attachment
+            if target == "none":
+                live_cmds.append(("attachment=none", ["controlvm", vm, f"nic{nic}", "null"]))
+            elif target == "nat":
+                live_cmds.append(("attachment=nat", ["controlvm", vm, f"nic{nic}", "nat"]))
+            else:
+                assert valid_net_name is not None
+                live_cmds.append(
+                    (
+                        f"attachment={target} ({valid_net_name})",
+                        ["controlvm", vm, f"nic{nic}", target, valid_net_name],
+                    )
+                )
+        if promisc_mode is not None:
+            live_cmds.append(
+                (
+                    f"promisc={promisc_mode}",
+                    ["controlvm", vm, f"nicpromisc{nic}", promisc_mode],
+                )
+            )
+        if cable_connected is not None:
+            link_state = "on" if cable_connected else "off"
+            live_cmds.append(
+                (
+                    f"cable={link_state}",
+                    ["controlvm", vm, f"setlinkstate{nic}", link_state],
+                )
+            )
+
+        for label, cmd in live_cmds:
+            res = run_vbox_cmd(cmd)
+            if not res.ok:
+                return (
+                    f"Error: Failed to apply live NIC {nic} setting ({label}) "
+                    f"on VM '{vm}': {res.error}"
+                )
+            changes.append(label)
+
+        return (
+            f"Successfully updated NIC {nic} on running VM '{vm}' (live via controlvm): "
+            + ", ".join(changes)
+            + "."
+        )
+
+    # Stopped / saved VM: apply atomically via modifyvm.
+    args: list[str] = ["modifyvm", vm]
+    if attachment is not None:
+        args.extend([f"--nic{nic}", attachment])
+        changes.append(f"attachment={attachment}")
+    if valid_net_name is not None:
+        flag_map = {
+            "natnetwork": f"--nat-network{nic}",
+            "intnet": f"--intnet{nic}",
+            "hostonly": f"--hostonlyadapter{nic}",
+            "bridged": f"--bridgeadapter{nic}",
+        }
+        args.extend([flag_map[effective_attachment], valid_net_name])
+        changes.append(f"network={valid_net_name}")
+    if cable_connected is not None:
+        link_state = "on" if cable_connected else "off"
+        args.extend([f"--cableconnected{nic}", link_state])
+        changes.append(f"cable={link_state}")
+    if promisc_mode is not None:
+        args.extend([f"--nicpromisc{nic}", promisc_mode])
+        changes.append(f"promisc={promisc_mode}")
+    if valid_mac is not None:
+        args.extend([f"--macaddress{nic}", valid_mac])
+        changes.append(f"mac={valid_mac}")
+
+    res = run_vbox_cmd(args)
+    if not res.ok:
+        return f"Error: Failed to configure NIC {nic} on VM '{vm}': {res.error}"
+
+    return (
+        f"Successfully configured NIC {nic} on VM '{vm}' (offline via modifyvm): "
+        + ", ".join(changes)
+        + "."
+    )
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_nat_networks(
+    action: Literal["list", "add", "modify", "remove", "start", "stop"],
+    network_name: str = "",
+    cidr: Optional[str] = None,
+    dhcp: Optional[bool] = None,
+    enable: Optional[bool] = None,
+    ipv6: Optional[bool] = None,
+) -> str:
+    """
+    List, create, modify, start, stop, or remove VirtualBox NAT Networks.
+
+    NAT Networks let multiple lab VMs communicate on an isolated virtual subnet
+    with DHCP while optionally reaching the internet without exposing ports on
+    the host LAN.
+
+    Args:
+        action (str): One of "list", "add", "modify", "remove", "start", "stop".
+        network_name (str): Name of the NAT network (required for all actions except "list").
+        cidr (str, optional): IPv4 CIDR block (e.g., "10.10.0.0/24"; required for "add").
+        dhcp (bool, optional): Enable or disable DHCP server on the NAT network (default True on "add").
+        enable (bool, optional): Enable or disable the NAT network (default True on "add").
+        ipv6 (bool, optional): Enable or disable IPv6 support on the NAT network.
+
+    Returns:
+        str: NAT network listing or confirmation message.
+    """
+    if action not in VALID_NAT_NET_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_NAT_NET_ACTIONS)}."
+        )
+
+    if action == "list":
+        res = run_vbox_cmd(["natnetwork", "list"])
+        if not res.ok:
+            return f"Error: Failed to list NAT networks: {res.error}"
+        output = res.stdout.strip()
+        if not output:
+            return "No VirtualBox NAT networks configured."
+        return f"### VirtualBox NAT Networks\n```\n{output}\n```"
+
+    try:
+        name = _validate_identifier(network_name, "network_name")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action in ("remove", "start", "stop"):
+        res = run_vbox_cmd(["natnetwork", action, "--netname", name])
+        if not res.ok:
+            return f"Error: Failed to {action} NAT network '{name}': {res.error}"
+        return f"Successfully executed '{action}' on NAT network '{name}'."
+
+    valid_cidr: Optional[str] = None
+    if cidr is not None:
+        try:
+            valid_cidr = _validate_ipv4_cidr(cidr, "cidr")
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    if action == "add":
+        if valid_cidr is None:
+            return "Error: cidr is required when action is 'add' (e.g., '10.10.0.0/24')."
+        dhcp_val = "on" if (dhcp is None or dhcp) else "off"
+        enable_flag = "--enable" if (enable is None or enable) else "--disable"
+        cmd = [
+            "natnetwork",
+            "add",
+            "--netname",
+            name,
+            "--network",
+            valid_cidr,
+            enable_flag,
+            "--dhcp",
+            dhcp_val,
+        ]
+        if ipv6 is not None:
+            cmd.extend(["--ipv6", "on" if ipv6 else "off"])
+        res = run_vbox_cmd(cmd)
+        if not res.ok:
+            return f"Error: Failed to add NAT network '{name}': {res.error}"
+        return (
+            f"Successfully created NAT network '{name}' "
+            f"(cidr=`{valid_cidr}`, dhcp=`{dhcp_val}`, enabled=`{enable is None or enable}`)."
+        )
+
+    # action == "modify"
+    if valid_cidr is None and dhcp is None and enable is None and ipv6 is None:
+        return (
+            "Error: Provide at least one setting to modify "
+            "(cidr, dhcp, enable, or ipv6)."
+        )
+
+    cmd = ["natnetwork", "modify", "--netname", name]
+    updates: list[str] = []
+    if valid_cidr is not None:
+        cmd.extend(["--network", valid_cidr])
+        updates.append(f"cidr={valid_cidr}")
+    if dhcp is not None:
+        dhcp_val = "on" if dhcp else "off"
+        cmd.extend(["--dhcp", dhcp_val])
+        updates.append(f"dhcp={dhcp_val}")
+    if enable is not None:
+        cmd.append("--enable" if enable else "--disable")
+        updates.append(f"enabled={enable}")
+    if ipv6 is not None:
+        ipv6_val = "on" if ipv6 else "off"
+        cmd.extend(["--ipv6", ipv6_val])
+        updates.append(f"ipv6={ipv6_val}")
+
+    res = run_vbox_cmd(cmd)
+    if not res.ok:
+        return f"Error: Failed to modify NAT network '{name}': {res.error}"
+    return f"Successfully modified NAT network '{name}': " + ", ".join(updates) + "."
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def capture_nic_traffic(
+    vm_name: str,
+    action: Literal["status", "start", "stop"],
+    adapter: int = 1,
+    output_path: str = "",
+) -> str:
+    """
+    Start, stop, or inspect hypervisor-level PCAP packet capture on a VM NIC.
+
+    Captures network traffic directly at the VirtualBox hypervisor layer without
+    running tcpdump/Wireshark inside the guest. Automatically uses `controlvm`
+    for running/paused VMs and `modifyvm` for stopped VMs.
+
+    Args:
+        vm_name (str): The name or UUID of the virtual machine.
+        action (str): One of "status", "start", "stop".
+        adapter (int): VirtualBox NIC index (1-8, default 1).
+        output_path (str): Host path for the .pcap file (required for "start").
+
+    Returns:
+        str: Capture status or confirmation with the host PCAP file path.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        nic = _validate_int_range(adapter, "adapter", 1, 8)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action not in VALID_CAPTURE_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_CAPTURE_ACTIONS)}."
+        )
+
+    info_res = run_vbox_cmd(["showvminfo", vm, "--machinereadable"])
+    if not info_res.ok:
+        return f"Error: Failed to inspect NIC {nic} capture state for VM '{vm}': {info_res.error}"
+    parsed = parse_machinereadable(info_res.stdout)
+    vm_state = parsed.get("VMState", "unknown").lower()
+    is_live = vm_state in ("running", "paused")
+    current_trace = parsed.get(f"nictrace{nic}", "off")
+    current_file = parsed.get(f"nictracefile{nic}", "")
+
+    if action == "status":
+        file_note = f", file=`{current_file}`" if current_file else ""
+        return (
+            f"PCAP capture status for VM '{vm}' NIC {nic} (state: `{vm_state}`): "
+            f"`{current_trace}`{file_note}."
+        )
+
+    if action == "start":
+        try:
+            raw_path = _validate_path_arg(output_path, "output_path")
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+        if not raw_path.lower().endswith((".pcap", ".pcapng")):
+            raw_path = f"{raw_path}.pcap"
+        abs_path = os.path.abspath(raw_path)
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if is_live:
+            file_res = run_vbox_cmd(["controlvm", vm, f"nictracefile{nic}", abs_path])
+            if not file_res.ok:
+                return (
+                    f"Error: Failed to set live capture file on VM '{vm}' NIC {nic}: "
+                    f"{file_res.error}"
+                )
+            on_res = run_vbox_cmd(["controlvm", vm, f"nictrace{nic}", "on"])
+            if not on_res.ok:
+                return (
+                    f"Error: Failed to start live PCAP capture on VM '{vm}' NIC {nic}: "
+                    f"{on_res.error}"
+                )
+            return (
+                f"Started live PCAP capture on VM '{vm}' NIC {nic}. "
+                f"Writing packets to '{abs_path}'."
+            )
+
+        res = run_vbox_cmd(
+            ["modifyvm", vm, f"--nictrace{nic}", "on", f"--nictracefile{nic}", abs_path]
+        )
+        if not res.ok:
+            return (
+                f"Error: Failed to enable PCAP capture on stopped VM '{vm}' NIC {nic}: "
+                f"{res.error}"
+            )
+        return (
+            f"Enabled PCAP capture on stopped VM '{vm}' NIC {nic}. "
+            f"Packets will be written to '{abs_path}' when the VM starts."
+        )
+
+    # action == "stop"
+    if is_live:
+        res = run_vbox_cmd(["controlvm", vm, f"nictrace{nic}", "off"])
+    else:
+        res = run_vbox_cmd(["modifyvm", vm, f"--nictrace{nic}", "off"])
+
+    if not res.ok:
+        return f"Error: Failed to stop PCAP capture on VM '{vm}' NIC {nic}: {res.error}"
+
+    mode_desc = "live" if is_live else "offline"
+    file_note = f" Capture file: '{current_file}'." if current_file else ""
+    return f"Stopped {mode_desc} PCAP capture on VM '{vm}' NIC {nic}.{file_note}"
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def dump_guest_memory(
+    vm_name: str,
+    output_path: str,
+    pause_during_dump: bool = True,
+    timeout: int = 600,
+) -> str:
+    """
+    Capture a raw ELF core dump of a running or paused VM's RAM for host forensics.
+
+    Wraps `VBoxManage debugvm <vm> dumpvmcore --filename <path>` so memory can be
+    analyzed with Volatility or similar tools without running acquisition agents
+    inside the guest.
+
+    Args:
+        vm_name (str): The name or UUID of the running or paused virtual machine.
+        output_path (str): Host file path where the ELF core dump will be written.
+        pause_during_dump (bool): Pause a running VM during the dump for a consistent
+            memory image and automatically resume it afterward (default True).
+        timeout (int): Command timeout in seconds (30-3600, default 600).
+
+    Returns:
+        str: Confirmation with dump path and size, or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        raw_path = _validate_path_arg(output_path, "output_path")
+        valid_timeout = _validate_int_range(timeout, "timeout", 30, 3600)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not os.path.splitext(raw_path)[1]:
+        raw_path = f"{raw_path}.elf"
+    abs_path = os.path.abspath(raw_path)
+
+    if os.path.exists(abs_path):
+        return (
+            f"Error: Output file '{abs_path}' already exists. "
+            "Choose a new path so existing forensic dumps are not overwritten."
+        )
+
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    info_res = run_vbox_cmd(["showvminfo", vm, "--machinereadable"])
+    if not info_res.ok:
+        return f"Error: Failed to inspect VM '{vm}': {info_res.error}"
+    vm_state = parse_machinereadable(info_res.stdout).get("VMState", "unknown").lower()
+
+    if vm_state not in ("running", "paused"):
+        return (
+            f"Error: VM '{vm}' is currently '{vm_state}'. "
+            "A VM must be running or paused to dump guest memory."
+        )
+
+    paused_by_us = False
+    if pause_during_dump and vm_state == "running":
+        pause_res = run_vbox_cmd(["controlvm", vm, "pause"])
+        if not pause_res.ok:
+            return f"Error: Failed to pause VM '{vm}' before memory dump: {pause_res.error}"
+        paused_by_us = True
+
+    resume_warning = ""
+    try:
+        dump_res = run_vbox_cmd(
+            ["debugvm", vm, "dumpvmcore", "--filename", abs_path],
+            timeout=valid_timeout,
+        )
+    finally:
+        if paused_by_us:
+            resume_res = run_vbox_cmd(["controlvm", vm, "resume"])
+            if not resume_res.ok:
+                resume_warning = (
+                    f" Warning: Failed to resume VM '{vm}' after dump: {resume_res.error}"
+                )
+
+    if not dump_res.ok:
+        return f"Error: Failed to dump guest memory for VM '{vm}': {dump_res.error}{resume_warning}"
+
+    size_note = ""
+    if os.path.exists(abs_path):
+        size_mb = os.path.getsize(abs_path) / (1024 * 1024)
+        size_note = f" ({size_mb:.1f} MB)"
+    consistency_note = (
+        " VM was paused during acquisition and resumed."
+        if paused_by_us
+        else " Captured while VM remained in its current state."
+    )
+    return (
+        f"Successfully dumped guest memory for VM '{vm}' to '{abs_path}'{size_note}."
+        f"{consistency_note}{resume_warning}"
+    )
+
+
+def _validate_ipv4_address(addr: str, field_name: str) -> str:
+    """Validate an IPv4 address or netmask (e.g., '192.168.56.1')."""
+    if not isinstance(addr, str):
+        raise ValueError(f"{field_name} must be an IPv4 address string.")
+    cleaned = addr.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if cleaned.startswith("-"):
+        raise ValueError(f"{field_name} cannot start with '-'.")
+    try:
+        parsed = ipaddress.IPv4Address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {field_name} '{cleaned}': {exc}") from exc
+    return str(parsed)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_hostonly_ifs(
+    action: Literal[
+        "list", "create", "configure", "remove", "dhcp-configure", "dhcp-remove"
+    ],
+    interface_name: str = "",
+    ip: Optional[str] = None,
+    netmask: str = "255.255.255.0",
+    dhcp_ip: Optional[str] = None,
+    lower_ip: Optional[str] = None,
+    upper_ip: Optional[str] = None,
+    enable_dhcp: bool = True,
+) -> str:
+    """
+    Create, configure, inspect, or remove VirtualBox Host-Only interfaces and DHCP servers.
+
+    Enables controlled host-to-guest communication on isolated subnets without
+    exposing lab VMs to the wider host LAN.
+
+    Args:
+        action (str): One of "list", "create", "configure", "remove", "dhcp-configure", "dhcp-remove".
+        interface_name (str): Host-only interface name (e.g., "vboxnet0" or "VirtualBox Host-Only Ethernet Adapter").
+        ip (str, optional): Static IPv4 address for the host-only adapter (required for "configure").
+        netmask (str): IPv4 netmask (default "255.255.255.0").
+        dhcp_ip (str, optional): DHCP server IPv4 address (required for "dhcp-configure").
+        lower_ip (str, optional): Start of DHCP address pool (required for "dhcp-configure").
+        upper_ip (str, optional): End of DHCP address pool (required for "dhcp-configure").
+        enable_dhcp (bool): Whether the DHCP server is enabled (default True for "dhcp-configure").
+
+    Returns:
+        str: Listing of host-only interfaces/DHCP servers or confirmation message.
+    """
+    if action not in VALID_HOSTONLY_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_HOSTONLY_ACTIONS)}."
+        )
+
+    if action == "list":
+        ifs_res = run_vbox_cmd(["list", "hostonlyifs"])
+        if not ifs_res.ok:
+            return f"Error: Failed to list host-only interfaces: {ifs_res.error}"
+        dhcp_res = run_vbox_cmd(["list", "dhcpservers"])
+        ifs_out = ifs_res.stdout.strip() or "(none)"
+        dhcp_out = dhcp_res.stdout.strip() if dhcp_res.ok else f"(error: {dhcp_res.error})"
+        if not dhcp_out:
+            dhcp_out = "(none)"
+        return (
+            "### VirtualBox Host-Only Interfaces\n"
+            f"```\n{ifs_out}\n```\n"
+            "### VirtualBox DHCP Servers\n"
+            f"```\n{dhcp_out}\n```"
+        )
+
+    if action == "create":
+        res = run_vbox_cmd(["hostonlyif", "create"])
+        if not res.ok:
+            return f"Error: Failed to create host-only interface: {res.error}"
+        out = res.stdout.strip()
+        return f"Successfully created host-only interface.\n{out}" if out else "Successfully created host-only interface."
+
+    try:
+        iface = _validate_identifier(interface_name, "interface_name")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action == "remove":
+        res = run_vbox_cmd(["hostonlyif", "remove", iface])
+        if not res.ok:
+            return f"Error: Failed to remove host-only interface '{iface}': {res.error}"
+        return f"Successfully removed host-only interface '{iface}'."
+
+    if action == "configure":
+        if ip is None:
+            return "Error: ip is required when action is 'configure'."
+        try:
+            valid_ip = _validate_ipv4_address(ip, "ip")
+            valid_mask = _validate_ipv4_address(netmask, "netmask")
+        except ValueError as exc:
+            return f"Error: {exc}"
+        res = run_vbox_cmd(
+            ["hostonlyif", "ipconfig", iface, "--ip", valid_ip, "--netmask", valid_mask]
+        )
+        if not res.ok:
+            return f"Error: Failed to configure host-only interface '{iface}': {res.error}"
+        return (
+            f"Successfully configured host-only interface '{iface}' "
+            f"(ip=`{valid_ip}`, netmask=`{valid_mask}`)."
+        )
+
+    if action == "dhcp-remove":
+        res = run_vbox_cmd(["dhcpserver", "remove", "--interface", iface])
+        if not res.ok:
+            return f"Error: Failed to remove DHCP server for '{iface}': {res.error}"
+        return f"Successfully removed DHCP server for host-only interface '{iface}'."
+
+    # action == "dhcp-configure"
+    if dhcp_ip is None or lower_ip is None or upper_ip is None:
+        return "Error: dhcp_ip, lower_ip, and upper_ip are required when action is 'dhcp-configure'."
+    try:
+        valid_dhcp = _validate_ipv4_address(dhcp_ip, "dhcp_ip")
+        valid_mask = _validate_ipv4_address(netmask, "netmask")
+        valid_lower = _validate_ipv4_address(lower_ip, "lower_ip")
+        valid_upper = _validate_ipv4_address(upper_ip, "upper_ip")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if ipaddress.IPv4Address(valid_lower) > ipaddress.IPv4Address(valid_upper):
+        return "Error: lower_ip must be less than or equal to upper_ip."
+
+    common_flags = [
+        "--interface",
+        iface,
+        "--server-ip",
+        valid_dhcp,
+        "--netmask",
+        valid_mask,
+        "--lower-ip",
+        valid_lower,
+        "--upper-ip",
+        valid_upper,
+        "--enable" if enable_dhcp else "--disable",
+    ]
+    res = run_vbox_cmd(["dhcpserver", "modify", *common_flags])
+    verb = "modified"
+    if not res.ok:
+        add_res = run_vbox_cmd(["dhcpserver", "add", *common_flags])
+        if not add_res.ok:
+            return (
+                f"Error: Failed to configure DHCP server for '{iface}': {add_res.error}"
+            )
+        verb = "created"
+    return (
+        f"Successfully {verb} DHCP server on '{iface}' "
+        f"(server=`{valid_dhcp}`, pool=`{valid_lower}`-`{valid_upper}`, enabled=`{enable_dhcp}`)."
+    )
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def send_guest_keystrokes(
+    vm_name: str,
+    text: Optional[str] = None,
+    keys: Optional[list[str]] = None,
+    scancodes: Optional[list[str]] = None,
+    press_enter: bool = False,
+) -> str:
+    """
+    Send text or special keystrokes to a running VM's virtual keyboard.
+
+    Works without VirtualBox Guest Additions — ideal for GRUB menus, LUKS disk
+    encryption prompts, BIOS/UEFI setup, BSD/appliance ISOs, and hardened targets.
+
+    Args:
+        vm_name (str): The name or UUID of the running virtual machine.
+        text (str, optional): Printable string to type via `keyboardputstring`.
+        keys (list[str], optional): Special key names (e.g., ["DOWN", "ENTER"], ["CTRL_ALT_DEL"],
+            ["ESC"], ["TAB"], ["F2"], ["CTRL_C"]). Supported: ESC, BACKSPACE, TAB, ENTER, SPACE,
+            UP, DOWN, LEFT, RIGHT, HOME, END, PAGEUP, PAGEDOWN, DELETE, F1-F12, CTRL_C, CTRL_D,
+            CTRL_Z, CTRL_ALT_DEL, ALT_F4.
+        scancodes (list[str], optional): Raw PS/2 Set 1 hex scancode bytes (e.g., ["1c", "9c"]).
+        press_enter (bool): Append an ENTER keypress after text/keys/scancodes (default False).
+
+    Returns:
+        str: Confirmation of sent keystrokes or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not text and not keys and not scancodes and not press_enter:
+        return (
+            "Error: Provide at least one of text, keys, scancodes, or press_enter=True."
+        )
+
+    if text is not None:
+        if not isinstance(text, str):
+            return "Error: text must be a string."
+        if any(ch in text for ch in ("\x00", "\r", "\n")):
+            return (
+                "Error: text cannot contain newline or NUL characters; "
+                "use press_enter=True or keys=['ENTER'] instead."
+            )
+
+    combined_codes: list[str] = []
+    if keys:
+        if not isinstance(keys, list):
+            return "Error: keys must be a list of key names."
+        for raw_key in keys:
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                return "Error: Each entry in keys must be a non-empty string."
+            norm = raw_key.strip().upper().replace("-", "_")
+            if norm not in _KEY_SCANCODES:
+                return (
+                    f"Error: Unsupported key '{raw_key}'. "
+                    f"Supported keys: {sorted(_KEY_SCANCODES.keys())}."
+                )
+            combined_codes.extend(_KEY_SCANCODES[norm])
+
+    if scancodes:
+        if not isinstance(scancodes, list):
+            return "Error: scancodes must be a list of 2-digit hex strings."
+        for code in scancodes:
+            if not isinstance(code, str) or not re.fullmatch(r"[0-9A-Fa-f]{2}", code.strip()):
+                return (
+                    f"Error: Invalid scancode '{code}'. "
+                    "Each scancode must be a 2-character hex byte (e.g., '1c')."
+                )
+            combined_codes.append(code.strip().lower())
+
+    if press_enter:
+        combined_codes.extend(_KEY_SCANCODES["ENTER"])
+
+    actions_sent: list[str] = []
+    if text:
+        res = run_vbox_cmd(["controlvm", vm, "keyboardputstring", text])
+        if not res.ok:
+            return f"Error: Failed to send text to VM '{vm}': {res.error}"
+        actions_sent.append(f"text ({len(text)} chars)")
+
+    if combined_codes:
+        res = run_vbox_cmd(["controlvm", vm, "keyboardputscancode", *combined_codes])
+        if not res.ok:
+            return f"Error: Failed to send keystrokes to VM '{vm}': {res.error}"
+        actions_sent.append(f"{len(combined_codes)} scancode byte(s)")
+
+    return f"Successfully sent {', '.join(actions_sent)} to VM '{vm}'."
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_range_snapshots(
+    action: Literal["snapshot", "revert"],
+    snapshot_name: str,
+    vm_names: Optional[list[str]] = None,
+    description: str = "",
+    live: bool = True,
+    restart: bool = True,
+    start_mode: Literal["headless", "gui", "separate"] = "headless",
+    confirm: bool = False,
+) -> str:
+    """
+    Batch snapshot or revert an entire multi-VM lab range in one call.
+
+    Targets all currently running VMs by default, or an explicit list of VM names.
+    When reverting, requires `confirm=True`, powers off running targets, restores
+    the named snapshot, and optionally restarts them.
+
+    Args:
+        action (str): "snapshot" to checkpoint all targets, or "revert" to restore them.
+        snapshot_name (str): Snapshot name to take or restore across all target VMs (e.g., "clean-range").
+        vm_names (list[str], optional): Explicit VM names/UUIDs. Defaults to all currently running VMs.
+        description (str): Optional snapshot description (for "snapshot").
+        live (bool): Take live snapshots without pausing running VMs (default True, for "snapshot").
+        restart (bool): Restart each VM after reverting (default True, for "revert").
+        start_mode (str): Power-on mode when restarting ("headless", "gui", "separate").
+        confirm (bool): Must be True to execute "revert" (safety guard against accidental state loss).
+
+    Returns:
+        str: Per-VM summary of snapshot or revert outcomes.
+    """
+    if action not in VALID_RANGE_SNAPSHOT_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_RANGE_SNAPSHOT_ACTIONS)}."
+        )
+
+    try:
+        snap = _validate_identifier(snapshot_name, "snapshot_name")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action == "revert":
+        if not confirm:
+            return (
+                f"Error: Range revert to snapshot '{snap}' is destructive and will power off "
+                "and discard unsaved VM state. Re-run with confirm=True to proceed."
+            )
+        if start_mode not in VALID_START_MODES:
+            return f"Error: Invalid start_mode '{start_mode}'. Must be one of {list(VALID_START_MODES)}."
+
+    running_res = run_vbox_cmd(["list", "runningvms"])
+    if not running_res.ok:
+        return f"Error: Failed to list running VMs: {running_res.error}"
+    running_entries = _parse_vm_entries(running_res.stdout)
+    running_names = {name for name, _ in running_entries}
+    running_uuids = {uid for _, uid in running_entries}
+
+    targets: list[str] = []
+    if vm_names is not None:
+        if not isinstance(vm_names, list) or not vm_names:
+            return "Error: vm_names must be a non-empty list of VM names or UUIDs."
+        try:
+            targets = [_validate_identifier(name, "vm_names[]") for name in vm_names]
+        except ValueError as exc:
+            return f"Error: {exc}"
+    else:
+        targets = [name for name, _ in running_entries]
+        if not targets:
+            return "No currently running VMs found to target."
+
+    results: list[str] = []
+    succeeded = 0
+    failed = 0
+
+    for vm in targets:
+        if action == "snapshot":
+            cmd = ["snapshot", vm, "take", snap]
+            if description:
+                cmd.extend(["--description", description])
+            if live:
+                cmd.append("--live")
+            res = run_vbox_cmd(cmd, timeout=120)
+            if res.ok:
+                succeeded += 1
+                results.append(f"- **{vm}:** Snapshot `{snap}` created.")
+            else:
+                failed += 1
+                results.append(f"- **{vm}:** FAILED ({res.error})")
+        else:
+            is_running = vm in running_names or vm in running_uuids
+            if is_running:
+                off_res = run_vbox_cmd(["controlvm", vm, "poweroff"], timeout=60)
+                if not off_res.ok:
+                    failed += 1
+                    results.append(f"- **{vm}:** FAILED to power off ({off_res.error})")
+                    continue
+            rest_res = run_vbox_cmd(["snapshot", vm, "restore", snap], timeout=120)
+            if not rest_res.ok:
+                failed += 1
+                results.append(f"- **{vm}:** FAILED to restore `{snap}` ({rest_res.error})")
+                continue
+            if restart:
+                start_res = run_vbox_cmd(["startvm", vm, "--type", start_mode], timeout=60)
+                if not start_res.ok:
+                    failed += 1
+                    results.append(
+                        f"- **{vm}:** Restored `{snap}`, but FAILED to restart ({start_res.error})"
+                    )
+                    continue
+                succeeded += 1
+                results.append(f"- **{vm}:** Reverted to `{snap}` and restarted (`{start_mode}`).")
+            else:
+                succeeded += 1
+                results.append(f"- **{vm}:** Reverted to `{snap}` (left powered off).")
+
+    header = (
+        f"### Range Snapshot `{snap}` ({action}): {succeeded} succeeded, {failed} failed"
+    )
+    return header + "\n" + "\n".join(results)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def inspect_guest_metrics(
+    action: Literal["setup", "query", "disable"] = "query",
+    target: str = "*",
+    metrics: str = "*",
+    period: int = 1,
+    samples: int = 5,
+) -> str:
+    """
+    Configure or query hypervisor-level performance metrics (CPU, RAM, Disk, Net).
+
+    Useful for detecting cryptominers, fork bombs, or ransomware encryption spikes
+    inside a sandbox without running monitoring agents inside the guest.
+
+    Args:
+        action (str): "setup" to start metric collection, "query" to read samples, or "disable" to stop.
+        target (str): VM name/UUID, "host", or "*" for all VMs and host (default "*").
+        metrics (str): Comma-separated metric list (e.g., "CPU/Load,RAM/Usage") or "*" (default "*").
+        period (int): Sampling interval in seconds (1-3600, default 1; used by "setup").
+        samples (int): Number of retained samples (1-1000, default 5; used by "setup").
+
+    Returns:
+        str: Metrics table or confirmation message.
+    """
+    if action not in VALID_METRICS_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_METRICS_ACTIONS)}."
+        )
+
+    cleaned_target = target.strip() if isinstance(target, str) else ""
+    if cleaned_target != "*":
+        try:
+            cleaned_target = _validate_identifier(cleaned_target, "target")
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    cleaned_metrics = metrics.strip() if isinstance(metrics, str) else ""
+    if not cleaned_metrics:
+        return "Error: metrics cannot be empty (use '*' for all metrics)."
+    if cleaned_metrics.startswith("-") or any(ord(ch) < 32 for ch in cleaned_metrics):
+        return "Error: metrics contains invalid characters or starts with '-'."
+
+    if action == "setup":
+        try:
+            valid_period = _validate_int_range(period, "period", 1, 3600)
+            valid_samples = _validate_int_range(samples, "samples", 1, 1000)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        res = run_vbox_cmd(
+            [
+                "metrics",
+                "setup",
+                "--period",
+                str(valid_period),
+                "--samples",
+                str(valid_samples),
+                cleaned_target,
+                cleaned_metrics,
+            ]
+        )
+        if not res.ok:
+            return f"Error: Failed to setup metrics for '{cleaned_target}': {res.error}"
+        return (
+            f"Enabled metrics collection for '{cleaned_target}' "
+            f"(metrics=`{cleaned_metrics}`, period={valid_period}s, samples={valid_samples})."
+        )
+
+    if action == "disable":
+        res = run_vbox_cmd(["metrics", "disable", cleaned_target, cleaned_metrics])
+        if not res.ok:
+            return f"Error: Failed to disable metrics for '{cleaned_target}': {res.error}"
+        return f"Disabled metrics collection for '{cleaned_target}' (metrics=`{cleaned_metrics}`)."
+
+    # action == "query"
+    res = run_vbox_cmd(["metrics", "query", cleaned_target, cleaned_metrics])
+    if not res.ok:
+        return f"Error: Failed to query metrics for '{cleaned_target}': {res.error}"
+    output = res.stdout.strip()
+    if not output:
+        return (
+            f"No metrics data returned for '{cleaned_target}'. "
+            "Call inspect_guest_metrics(action='setup', target=...) first to enable collection."
+        )
+    return f"### VirtualBox Metrics ({cleaned_target})\n```\n{output}\n```"
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def manage_disk_images(
+    action: Literal["list", "create", "clone", "set-type", "attach", "detach"],
+    disk_path: str = "",
+    output_path: str = "",
+    size_mb: int = 10240,
+    disk_format: Literal["VDI", "VMDK", "VHD"] = "VDI",
+    disk_type: Literal[
+        "normal", "immutable", "readonly", "writethrough", "multiattach"
+    ] = "normal",
+    vm_name: str = "",
+    controller: str = "SATA Controller",
+    port: int = 1,
+    device: int = 0,
+) -> str:
+    """
+    Create, clone, change mode, attach, detach, or list VirtualBox virtual hard disks.
+
+    Useful for attaching read-only or immutable forensic evidence drives, or creating
+    and swapping clean scratch disks between sandbox runs.
+
+    Args:
+        action (str): One of "list", "create", "clone", "set-type", "attach", "detach".
+        disk_path (str): Path to the disk image (required for "create", "clone", "set-type", "attach").
+        output_path (str): Destination path for "clone".
+        size_mb (int): Disk size in MB for "create" (10-2097152, default 10240).
+        disk_format (str): Disk image format ("VDI", "VMDK", "VHD", default "VDI").
+        disk_type (str): Medium mode ("normal", "immutable", "readonly", "writethrough", "multiattach").
+        vm_name (str): Target VM name/UUID (required for "attach" and "detach").
+        controller (str): Storage controller name (default "SATA Controller").
+        port (int): Controller port index (0-30, default 1).
+        device (int): Controller device index (0-1, default 0).
+
+    Returns:
+        str: Disk listing or confirmation message.
+    """
+    if action not in VALID_DISK_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. "
+            f"Must be one of {list(VALID_DISK_ACTIONS)}."
+        )
+
+    if action == "list":
+        res = run_vbox_cmd(["list", "hdds"])
+        if not res.ok:
+            return f"Error: Failed to list virtual hard disks: {res.error}"
+        out = res.stdout.strip()
+        if not out:
+            return "No VirtualBox hard disk images registered."
+        return f"### VirtualBox Hard Disk Images\n```\n{out}\n```"
+
+    if action == "create":
+        if disk_format not in VALID_DISK_FORMATS:
+            return f"Error: Invalid disk_format '{disk_format}'. Must be one of {list(VALID_DISK_FORMATS)}."
+        try:
+            raw_path = _validate_path_arg(disk_path, "disk_path")
+            valid_size = _validate_int_range(size_mb, "size_mb", 10, 2097152)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        abs_path = os.path.abspath(raw_path)
+        if os.path.exists(abs_path):
+            return f"Error: Disk image '{abs_path}' already exists."
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        res = run_vbox_cmd(
+            [
+                "createmedium",
+                "disk",
+                "--filename",
+                abs_path,
+                "--size",
+                str(valid_size),
+                "--format",
+                disk_format,
+            ],
+            timeout=120,
+        )
+        if not res.ok:
+            return f"Error: Failed to create disk image '{abs_path}': {res.error}"
+        return f"Successfully created {disk_format} disk image '{abs_path}' ({valid_size} MB)."
+
+    if action == "clone":
+        if disk_format not in VALID_DISK_FORMATS:
+            return f"Error: Invalid disk_format '{disk_format}'. Must be one of {list(VALID_DISK_FORMATS)}."
+        try:
+            src_raw = _validate_path_arg(disk_path, "disk_path")
+            dst_raw = _validate_path_arg(output_path, "output_path")
+        except ValueError as exc:
+            return f"Error: {exc}"
+        src_abs = os.path.abspath(src_raw)
+        dst_abs = os.path.abspath(dst_raw)
+        if not os.path.exists(src_abs):
+            return f"Error: Source disk image '{src_abs}' does not exist."
+        if os.path.exists(dst_abs):
+            return f"Error: Destination disk image '{dst_abs}' already exists."
+        parent = os.path.dirname(dst_abs)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        res = run_vbox_cmd(
+            ["clonemedium", "disk", src_abs, dst_abs, "--format", disk_format],
+            timeout=600,
+        )
+        if not res.ok:
+            return f"Error: Failed to clone disk image '{src_abs}': {res.error}"
+        return f"Successfully cloned '{src_abs}' to '{dst_abs}' ({disk_format})."
+
+    if action == "set-type":
+        if disk_type not in VALID_DISK_TYPES:
+            return f"Error: Invalid disk_type '{disk_type}'. Must be one of {list(VALID_DISK_TYPES)}."
+        try:
+            raw_path = _validate_path_arg(disk_path, "disk_path")
+        except ValueError as exc:
+            return f"Error: {exc}"
+        abs_path = os.path.abspath(raw_path)
+        res = run_vbox_cmd(["modifymedium", "disk", abs_path, "--type", disk_type])
+        if not res.ok:
+            return f"Error: Failed to set disk type on '{abs_path}': {res.error}"
+        return f"Successfully set disk image '{abs_path}' mode to `{disk_type}`."
+
+    # action in ("attach", "detach")
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        ctrl = _validate_identifier(controller, "controller")
+        valid_port = _validate_int_range(port, "port", 0, 30)
+        valid_dev = _validate_int_range(device, "device", 0, 1)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if action == "detach":
+        res = run_vbox_cmd(
+            [
+                "storageattach",
+                vm,
+                "--storagectl",
+                ctrl,
+                "--port",
+                str(valid_port),
+                "--device",
+                str(valid_dev),
+                "--type",
+                "hdd",
+                "--medium",
+                "none",
+            ]
+        )
+        if not res.ok:
+            return f"Error: Failed to detach disk from VM '{vm}': {res.error}"
+        return (
+            f"Successfully detached hard disk from VM '{vm}' "
+            f"({ctrl} port {valid_port}, device {valid_dev})."
+        )
+
+    # action == "attach"
+    if disk_type not in VALID_DISK_TYPES:
+        return f"Error: Invalid disk_type '{disk_type}'. Must be one of {list(VALID_DISK_TYPES)}."
+    try:
+        raw_path = _validate_path_arg(disk_path, "disk_path")
+    except ValueError as exc:
+        return f"Error: {exc}"
+    abs_path = os.path.abspath(raw_path)
+    if not os.path.exists(abs_path):
+        return f"Error: Disk image '{abs_path}' does not exist."
+
+    res = run_vbox_cmd(
+        [
+            "storageattach",
+            vm,
+            "--storagectl",
+            ctrl,
+            "--port",
+            str(valid_port),
+            "--device",
+            str(valid_dev),
+            "--type",
+            "hdd",
+            "--medium",
+            abs_path,
+            "--mtype",
+            disk_type,
+        ]
+    )
+    if not res.ok:
+        return f"Error: Failed to attach disk '{abs_path}' to VM '{vm}': {res.error}"
+    return (
+        f"Successfully attached '{abs_path}' (`{disk_type}`) to VM '{vm}' "
+        f"({ctrl} port {valid_port}, device {valid_dev})."
+    )
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@tool_guard
+def get_guest_process_list(vm_name: str, timeout: int = 30) -> str:
+    """
+    List active VirtualBox Guest Control processes on a running VM.
+
+    Wraps `VBoxManage guestcontrol <vm> list processes --verbose`. Note: VirtualBox
+    only reports processes spawned via Guest Control sessions here (to inspect the
+    full guest OS process table, run `ps` or `tasklist` via `execute_guest_command`).
+
+    Args:
+        vm_name (str): The name or UUID of the running virtual machine.
+        timeout (int): Command timeout in seconds (5-120, default 30).
+
+    Returns:
+        str: Active Guest Control process listing or error details.
+    """
+    try:
+        vm = _validate_identifier(vm_name, "vm_name")
+        valid_timeout = _validate_int_range(timeout, "timeout", 5, 120)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    res = run_vbox_cmd(
+        ["guestcontrol", vm, "list", "processes", "--verbose"],
+        timeout=valid_timeout,
+    )
+    if not res.ok:
+        return f"Error: Failed to list guestcontrol processes for VM '{vm}': {res.error}"
+    out = res.stdout.strip()
+    if not out:
+        return f"No active Guest Control processes reported for VM '{vm}'."
+    return f"### Guest Control Processes for VM: {vm}\n```\n{out}\n```"
 
 
 @mcp.resource("vbox://vms")

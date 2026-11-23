@@ -1507,13 +1507,645 @@ class TestVirtualBoxMCP(unittest.TestCase):
             self.assertIn("No Kali Linux provisioning source found", missing_err)
             self.assertIn("download=True", missing_err)
 
+    @patch("server.run_vbox_cmd")
+    def test_manage_network_adapters_list_and_configure_offline(
+        self, mock_cmd: MagicMock
+    ) -> None:
+        info_out = (
+            'VMState="poweroff"\n'
+            'nic1="natnetwork"\n'
+            'natnet1="PentestNet"\n'
+            'cableconnected1="on"\n'
+            'nicpromisc1="allow-vms"\n'
+            'macaddress1="080027112233"\n'
+            'nic2="intnet"\n'
+            'intnet2="AD-Lab"\n'
+            'nic3="none"\n'
+        )
+        mock_cmd.return_value = server.CommandResult(0, info_out, "")
+        listed = server.manage_network_adapters("Kali-Agent", action="list")
+        self.assertIn("NIC 1:", listed)
+        self.assertIn("mode=`natnetwork`", listed)
+        self.assertIn("network=`PentestNet`", listed)
+        self.assertIn("NIC 2:", listed)
+        self.assertIn("network=`AD-Lab`", listed)
+        self.assertNotIn("NIC 3:", listed)
+
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [
+            server.CommandResult(0, info_out, ""),
+            server.CommandResult(0, "", ""),
+        ]
+        res = server.manage_network_adapters(
+            "Kali-Agent",
+            action="configure",
+            adapter=2,
+            attachment="intnet",
+            network_name="IsolatedRange",
+            cable_connected=True,
+            promisc_mode="allow-all",
+            mac_address="08:00:27:aa:bb:cc",
+        )
+        self.assertIn("offline via modifyvm", res)
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0],
+            [
+                "modifyvm",
+                "Kali-Agent",
+                "--nic2",
+                "intnet",
+                "--intnet2",
+                "IsolatedRange",
+                "--cableconnected2",
+                "on",
+                "--nicpromisc2",
+                "allow-all",
+                "--macaddress2",
+                "080027AABBCC",
+            ],
+        )
+
+    @patch("server.run_vbox_cmd")
+    def test_manage_network_adapters_live_and_validation(self, mock_cmd: MagicMock) -> None:
+        running_info = 'VMState="running"\nnic1="nat"\n'
+        mock_cmd.side_effect = [
+            server.CommandResult(0, running_info, ""),
+            server.CommandResult(0, "", ""),
+            server.CommandResult(0, "", ""),
+            server.CommandResult(0, "", ""),
+        ]
+        res = server.manage_network_adapters(
+            "Kali-Agent",
+            action="configure",
+            adapter=1,
+            attachment="natnetwork",
+            network_name="RangeNet",
+            promisc_mode="allow-vms",
+            cable_connected=False,
+        )
+        self.assertIn("live via controlvm", res)
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0],
+            ["controlvm", "Kali-Agent", "nic1", "natnetwork", "RangeNet"],
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[2].args[0],
+            ["controlvm", "Kali-Agent", "nicpromisc1", "allow-vms"],
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[3].args[0],
+            ["controlvm", "Kali-Agent", "setlinkstate1", "off"],
+        )
+
+        # Air-gapping a running VM maps `none` -> `controlvm nic1 null`.
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [
+            server.CommandResult(0, running_info, ""),
+            server.CommandResult(0, "", ""),
+        ]
+        airgap = server.manage_network_adapters(
+            "Kali-Agent", action="configure", adapter=1, attachment="none"
+        )
+        self.assertIn("attachment=none", airgap)
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0],
+            ["controlvm", "Kali-Agent", "nic1", "null"],
+        )
+
+        # Changing MAC on a running VM is rejected.
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [server.CommandResult(0, running_info, "")]
+        mac_err = server.manage_network_adapters(
+            "Kali-Agent", action="configure", adapter=1, mac_address="auto"
+        )
+        self.assertIn("Cannot change mac_address", mac_err)
+
+        # Missing network_name for intnet/natnetwork is rejected.
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [server.CommandResult(0, running_info, "")]
+        net_err = server.manage_network_adapters(
+            "Kali-Agent", action="configure", adapter=1, attachment="intnet"
+        )
+        self.assertIn("network_name is required", net_err)
+
+        # Invalid MAC format is rejected.
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [server.CommandResult(0, running_info, "")]
+        bad_mac = server.manage_network_adapters(
+            "Kali-Agent", action="configure", adapter=1, mac_address="not-a-mac"
+        )
+        self.assertIn("mac_address must be", bad_mac)
+
+    @patch("server.run_vbox_cmd")
+    def test_manage_nat_networks_actions_and_validation(self, mock_cmd: MagicMock) -> None:
+        mock_cmd.return_value = server.CommandResult(
+            0, "NetworkName:    PentestNet\nIP:             10.10.0.1\n", ""
+        )
+        listed = server.manage_nat_networks(action="list")
+        self.assertIn("PentestNet", listed)
+        mock_cmd.assert_called_once_with(["natnetwork", "list"])
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        added = server.manage_nat_networks(
+            action="add",
+            network_name="PentestNet",
+            cidr="10.10.0.0/24",
+            dhcp=True,
+            enable=True,
+            ipv6=False,
+        )
+        self.assertIn("Successfully created NAT network 'PentestNet'", added)
+        mock_cmd.assert_called_once_with(
+            [
+                "natnetwork",
+                "add",
+                "--netname",
+                "PentestNet",
+                "--network",
+                "10.10.0.0/24",
+                "--enable",
+                "--dhcp",
+                "on",
+                "--ipv6",
+                "off",
+            ]
+        )
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        modified = server.manage_nat_networks(
+            action="modify", network_name="PentestNet", dhcp=False, enable=False
+        )
+        self.assertIn("dhcp=off", modified)
+        mock_cmd.assert_called_once_with(
+            ["natnetwork", "modify", "--netname", "PentestNet", "--dhcp", "off", "--disable"]
+        )
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        started = server.manage_nat_networks(action="start", network_name="PentestNet")
+        self.assertIn("Successfully executed 'start'", started)
+        mock_cmd.assert_called_once_with(["natnetwork", "start", "--netname", "PentestNet"])
+
+        # Validation errors: host bits set in CIDR, missing CIDR on add, empty modify.
+        bad_cidr = server.manage_nat_networks(
+            action="add", network_name="BadNet", cidr="10.10.0.5/24"
+        )
+        self.assertIn("Invalid cidr", bad_cidr)
+
+        missing_cidr = server.manage_nat_networks(action="add", network_name="BadNet")
+        self.assertIn("cidr is required", missing_cidr)
+
+        empty_mod = server.manage_nat_networks(action="modify", network_name="PentestNet")
+        self.assertIn("Provide at least one setting", empty_mod)
+
+    @patch("server.run_vbox_cmd")
+    def test_capture_nic_traffic_live_and_offline(self, mock_cmd: MagicMock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pcap_base = os.path.join(tmpdir, "lab_capture")
+            expected_pcap = os.path.abspath(f"{pcap_base}.pcap")
+
+            # Status check.
+            mock_cmd.return_value = server.CommandResult(
+                0,
+                f'VMState="running"\nnictrace1="on"\nnictracefile1="{expected_pcap}"\n',
+                "",
+            )
+            status = server.capture_nic_traffic("Kali-Agent", action="status", adapter=1)
+            self.assertIn("`on`", status)
+            self.assertIn(expected_pcap, status)
+
+            # Live start uses controlvm nictracefile1 + nictrace1 on.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, 'VMState="running"\n', ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+            ]
+            started = server.capture_nic_traffic(
+                "Kali-Agent", action="start", adapter=1, output_path=pcap_base
+            )
+            self.assertIn("Started live PCAP capture", started)
+            self.assertEqual(
+                mock_cmd.call_args_list[1].args[0],
+                ["controlvm", "Kali-Agent", "nictracefile1", expected_pcap],
+            )
+            self.assertEqual(
+                mock_cmd.call_args_list[2].args[0],
+                ["controlvm", "Kali-Agent", "nictrace1", "on"],
+            )
+
+            # Live stop uses controlvm nictrace1 off.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(
+                    0, f'VMState="running"\nnictracefile1="{expected_pcap}"\n', ""
+                ),
+                server.CommandResult(0, "", ""),
+            ]
+            stopped = server.capture_nic_traffic("Kali-Agent", action="stop", adapter=1)
+            self.assertIn("Stopped live PCAP capture", stopped)
+            self.assertIn(expected_pcap, stopped)
+            self.assertEqual(
+                mock_cmd.call_args_list[1].args[0],
+                ["controlvm", "Kali-Agent", "nictrace1", "off"],
+            )
+
+            # Offline start uses modifyvm.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, 'VMState="poweroff"\n', ""),
+                server.CommandResult(0, "", ""),
+            ]
+            offline = server.capture_nic_traffic(
+                "Kali-Agent", action="start", adapter=2, output_path=expected_pcap
+            )
+            self.assertIn("stopped VM", offline)
+            self.assertEqual(
+                mock_cmd.call_args_list[1].args[0],
+                ["modifyvm", "Kali-Agent", "--nictrace2", "on", "--nictracefile2", expected_pcap],
+            )
+
+    @patch("server.run_vbox_cmd")
+    def test_dump_guest_memory_pause_resume_and_guards(self, mock_cmd: MagicMock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dump_base = os.path.join(tmpdir, "memdump")
+            expected_elf = os.path.abspath(f"{dump_base}.elf")
+
+            # Running VM with pause_during_dump=True pauses, dumps, and resumes.
+            mock_cmd.side_effect = [
+                server.CommandResult(0, 'VMState="running"\n', ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(0, "", ""),
+            ]
+            ok_msg = server.dump_guest_memory("Kali-Agent", output_path=dump_base)
+            self.assertIn("Successfully dumped guest memory", ok_msg)
+            self.assertIn(expected_elf, ok_msg)
+            self.assertIn("paused during acquisition and resumed", ok_msg)
+            self.assertEqual(
+                mock_cmd.call_args_list[1].args[0], ["controlvm", "Kali-Agent", "pause"]
+            )
+            self.assertEqual(
+                mock_cmd.call_args_list[2].args[0],
+                ["debugvm", "Kali-Agent", "dumpvmcore", "--filename", expected_elf],
+            )
+            self.assertEqual(
+                mock_cmd.call_args_list[3].args[0], ["controlvm", "Kali-Agent", "resume"]
+            )
+
+            # Even if dumpvmcore fails, a VM paused by us is still resumed.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [
+                server.CommandResult(0, 'VMState="running"\n', ""),
+                server.CommandResult(0, "", ""),
+                server.CommandResult(1, "", "disk full", "disk full"),
+                server.CommandResult(0, "", ""),
+            ]
+            fail_msg = server.dump_guest_memory("Kali-Agent", output_path=dump_base)
+            self.assertIn("Failed to dump guest memory", fail_msg)
+            self.assertEqual(
+                mock_cmd.call_args_list[3].args[0], ["controlvm", "Kali-Agent", "resume"]
+            )
+
+            # Stopped VM is rejected cleanly.
+            mock_cmd.reset_mock()
+            mock_cmd.side_effect = [server.CommandResult(0, 'VMState="poweroff"\n', "")]
+            stopped_err = server.dump_guest_memory("Kali-Agent", output_path=dump_base)
+            self.assertIn("must be running or paused", stopped_err)
+
+            # Existing output file is not overwritten.
+            existing = os.path.join(tmpdir, "existing.elf")
+            with open(existing, "wb") as handle:
+                handle.write(b"ELF")
+            mock_cmd.reset_mock()
+            exists_err = server.dump_guest_memory("Kali-Agent", output_path=existing)
+            self.assertIn("already exists", exists_err)
+            mock_cmd.assert_not_called()
+
+    @patch("server.run_vbox_cmd")
+    def test_manage_hostonly_ifs_crud_and_dhcp(self, mock_cmd: MagicMock) -> None:
+        mock_cmd.side_effect = [
+            server.CommandResult(0, "Name: vboxnet0\nIPAddress: 192.168.56.1\n", ""),
+            server.CommandResult(0, "NetworkName: HostInterfaceNetworking-vboxnet0\n", ""),
+        ]
+        listed = server.manage_hostonly_ifs(action="list")
+        self.assertIn("vboxnet0", listed)
+        self.assertIn("HostInterfaceNetworking-vboxnet0", listed)
+
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = None
+        mock_cmd.return_value = server.CommandResult(
+            0, "Interface 'vboxnet1' was successfully created", ""
+        )
+        created = server.manage_hostonly_ifs(action="create")
+        self.assertIn("vboxnet1", created)
+        mock_cmd.assert_called_once_with(["hostonlyif", "create"])
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        configured = server.manage_hostonly_ifs(
+            action="configure",
+            interface_name="vboxnet1",
+            ip="192.168.57.1",
+            netmask="255.255.255.0",
+        )
+        self.assertIn("192.168.57.1", configured)
+        mock_cmd.assert_called_once_with(
+            ["hostonlyif", "ipconfig", "vboxnet1", "--ip", "192.168.57.1", "--netmask", "255.255.255.0"]
+        )
+
+        # dhcp-configure falls back from modify to add if server doesn't exist yet.
+        mock_cmd.reset_mock()
+        mock_cmd.side_effect = [
+            server.CommandResult(1, "", "DHCP server does not exist", "DHCP server does not exist"),
+            server.CommandResult(0, "", ""),
+        ]
+        dhcp_res = server.manage_hostonly_ifs(
+            action="dhcp-configure",
+            interface_name="vboxnet1",
+            dhcp_ip="192.168.57.2",
+            lower_ip="192.168.57.100",
+            upper_ip="192.168.57.200",
+        )
+        self.assertIn("Successfully created DHCP server", dhcp_res)
+        self.assertEqual(mock_cmd.call_args_list[1].args[0][0:2], ["dhcpserver", "add"])
+
+        # Rejects inverted DHCP range.
+        range_err = server.manage_hostonly_ifs(
+            action="dhcp-configure",
+            interface_name="vboxnet1",
+            dhcp_ip="192.168.57.2",
+            lower_ip="192.168.57.200",
+            upper_ip="192.168.57.100",
+        )
+        self.assertIn("lower_ip must be less than or equal to upper_ip", range_err)
+
+    @patch("server.run_vbox_cmd")
+    def test_send_guest_keystrokes_text_keys_and_validation(self, mock_cmd: MagicMock) -> None:
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        res = server.send_guest_keystrokes(
+            "Kali-Agent", text="kali", keys=["TAB"], press_enter=True
+        )
+        self.assertIn("Successfully sent", res)
+        self.assertEqual(
+            mock_cmd.call_args_list[0].args[0],
+            ["controlvm", "Kali-Agent", "keyboardputstring", "kali"],
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0],
+            ["controlvm", "Kali-Agent", "keyboardputscancode", "0f", "8f", "1c", "9c"],
+        )
+
+        mock_cmd.reset_mock()
+        res_cad = server.send_guest_keystrokes("Kali-Agent", keys=["ctrl-alt-del"])
+        self.assertIn("8 scancode byte(s)", res_cad)
+        self.assertEqual(
+            mock_cmd.call_args.args[0],
+            [
+                "controlvm",
+                "Kali-Agent",
+                "keyboardputscancode",
+                "1d",
+                "38",
+                "e0",
+                "53",
+                "e0",
+                "d3",
+                "b8",
+                "9d",
+            ],
+        )
+
+        # Validation errors.
+        self.assertIn("Provide at least one", server.send_guest_keystrokes("Kali-Agent"))
+        self.assertIn(
+            "Unsupported key", server.send_guest_keystrokes("Kali-Agent", keys=["NO_SUCH_KEY"])
+        )
+        self.assertIn(
+            "Invalid scancode", server.send_guest_keystrokes("Kali-Agent", scancodes=["ZZ"])
+        )
+        self.assertIn(
+            "newline", server.send_guest_keystrokes("Kali-Agent", text="line1\nline2")
+        )
+
+    @patch("server.run_vbox_cmd")
+    def test_manage_range_snapshots_batch_snapshot_and_revert(self, mock_cmd: MagicMock) -> None:
+        running_out = '"Kali-Agent" {1111}\n"Target-AD" {2222}\n'
+        mock_cmd.side_effect = [
+            server.CommandResult(0, running_out, ""),
+            server.CommandResult(0, "", ""),
+            server.CommandResult(0, "", ""),
+        ]
+        snap_res = server.manage_range_snapshots(
+            action="snapshot", snapshot_name="clean-range", description="Before scan"
+        )
+        self.assertIn("2 succeeded, 0 failed", snap_res)
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0],
+            ["snapshot", "Kali-Agent", "take", "clean-range", "--description", "Before scan", "--live"],
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[2].args[0],
+            ["snapshot", "Target-AD", "take", "clean-range", "--description", "Before scan", "--live"],
+        )
+
+        # Revert without confirm=True is blocked.
+        mock_cmd.reset_mock()
+        guard_err = server.manage_range_snapshots(
+            action="revert", snapshot_name="clean-range", confirm=False
+        )
+        self.assertIn("confirm=True", guard_err)
+        mock_cmd.assert_not_called()
+
+        # Revert with confirm=True powers off running VMs, restores, and restarts.
+        mock_cmd.side_effect = [
+            server.CommandResult(0, running_out, ""),
+            server.CommandResult(0, "", ""),  # poweroff Kali-Agent
+            server.CommandResult(0, "", ""),  # restore Kali-Agent
+            server.CommandResult(0, "", ""),  # startvm Kali-Agent
+            server.CommandResult(0, "", ""),  # poweroff Target-AD
+            server.CommandResult(0, "", ""),  # restore Target-AD
+            server.CommandResult(0, "", ""),  # startvm Target-AD
+        ]
+        rev_res = server.manage_range_snapshots(
+            action="revert", snapshot_name="clean-range", confirm=True, restart=True
+        )
+        self.assertIn("2 succeeded, 0 failed", rev_res)
+        self.assertEqual(
+            mock_cmd.call_args_list[1].args[0], ["controlvm", "Kali-Agent", "poweroff"]
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[2].args[0], ["snapshot", "Kali-Agent", "restore", "clean-range"]
+        )
+        self.assertEqual(
+            mock_cmd.call_args_list[3].args[0], ["startvm", "Kali-Agent", "--type", "headless"]
+        )
+
+    @patch("server.run_vbox_cmd")
+    def test_inspect_guest_metrics_setup_query_disable(self, mock_cmd: MagicMock) -> None:
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        setup_res = server.inspect_guest_metrics(
+            action="setup", target="Kali-Agent", metrics="CPU/Load,RAM/Usage", period=2, samples=10
+        )
+        self.assertIn("Enabled metrics collection", setup_res)
+        mock_cmd.assert_called_once_with(
+            [
+                "metrics",
+                "setup",
+                "--period",
+                "2",
+                "--samples",
+                "10",
+                "Kali-Agent",
+                "CPU/Load,RAM/Usage",
+            ]
+        )
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(
+            0, "Object     Metric       Values\nKali-Agent CPU/Load/User 12.5%\n", ""
+        )
+        query_res = server.inspect_guest_metrics(action="query", target="Kali-Agent")
+        self.assertIn("12.5%", query_res)
+
+        mock_cmd.reset_mock()
+        mock_cmd.return_value = server.CommandResult(0, "", "")
+        dis_res = server.inspect_guest_metrics(action="disable", target="*")
+        self.assertIn("Disabled metrics collection", dis_res)
+        mock_cmd.assert_called_once_with(["metrics", "disable", "*", "*"])
+
+    @patch("server.run_vbox_cmd")
+    def test_manage_disk_images_lifecycle(self, mock_cmd: MagicMock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scratch_vdi = os.path.join(tmpdir, "scratch.vdi")
+            clone_vdi = os.path.join(tmpdir, "scratch_clone.vdi")
+
+            mock_cmd.return_value = server.CommandResult(0, "", "")
+            created = server.manage_disk_images(
+                action="create", disk_path=scratch_vdi, size_mb=2048, disk_format="VDI"
+            )
+            self.assertIn("Successfully created VDI disk image", created)
+            mock_cmd.assert_called_once_with(
+                [
+                    "createmedium",
+                    "disk",
+                    "--filename",
+                    os.path.abspath(scratch_vdi),
+                    "--size",
+                    "2048",
+                    "--format",
+                    "VDI",
+                ],
+                timeout=120,
+            )
+
+            # Create dummy file to test clone & attach.
+            with open(scratch_vdi, "wb") as handle:
+                handle.write(b"VDI")
+
+            mock_cmd.reset_mock()
+            cloned = server.manage_disk_images(
+                action="clone", disk_path=scratch_vdi, output_path=clone_vdi, disk_format="VMDK"
+            )
+            self.assertIn("Successfully cloned", cloned)
+            mock_cmd.assert_called_once_with(
+                [
+                    "clonemedium",
+                    "disk",
+                    os.path.abspath(scratch_vdi),
+                    os.path.abspath(clone_vdi),
+                    "--format",
+                    "VMDK",
+                ],
+                timeout=600,
+            )
+
+            mock_cmd.reset_mock()
+            set_mode = server.manage_disk_images(
+                action="set-type", disk_path=scratch_vdi, disk_type="immutable"
+            )
+            self.assertIn("`immutable`", set_mode)
+            mock_cmd.assert_called_once_with(
+                ["modifymedium", "disk", os.path.abspath(scratch_vdi), "--type", "immutable"]
+            )
+
+            mock_cmd.reset_mock()
+            attached = server.manage_disk_images(
+                action="attach",
+                vm_name="Kali-Agent",
+                disk_path=scratch_vdi,
+                disk_type="readonly",
+                port=2,
+            )
+            self.assertIn("Successfully attached", attached)
+            mock_cmd.assert_called_once_with(
+                [
+                    "storageattach",
+                    "Kali-Agent",
+                    "--storagectl",
+                    "SATA Controller",
+                    "--port",
+                    "2",
+                    "--device",
+                    "0",
+                    "--type",
+                    "hdd",
+                    "--medium",
+                    os.path.abspath(scratch_vdi),
+                    "--mtype",
+                    "readonly",
+                ]
+            )
+
+            mock_cmd.reset_mock()
+            detached = server.manage_disk_images(
+                action="detach", vm_name="Kali-Agent", port=2
+            )
+            self.assertIn("Successfully detached", detached)
+            mock_cmd.assert_called_once_with(
+                [
+                    "storageattach",
+                    "Kali-Agent",
+                    "--storagectl",
+                    "SATA Controller",
+                    "--port",
+                    "2",
+                    "--device",
+                    "0",
+                    "--type",
+                    "hdd",
+                    "--medium",
+                    "none",
+                ]
+            )
+
+    @patch("server.run_vbox_cmd")
+    def test_get_guest_process_list(self, mock_cmd: MagicMock) -> None:
+        mock_cmd.return_value = server.CommandResult(
+            0, "Listing 1 process(es):\nPID 42: /usr/bin/python3\n", ""
+        )
+        out = server.get_guest_process_list("Kali-Agent")
+        self.assertIn("PID 42", out)
+        mock_cmd.assert_called_once_with(
+            ["guestcontrol", "Kali-Agent", "list", "processes", "--verbose"], timeout=30
+        )
+
     def test_native_tool_annotations_and_no_monkey_patch(self) -> None:
         self.assertFalse(hasattr(server, "_patched_tool"))
         tools = asyncio.run(server.mcp.list_tools())
-        self.assertEqual(len(tools), 22)
+        self.assertEqual(len(tools), 32)
         by_name = {t.name: t for t in tools}
 
-        for ro_name in ("list_vms", "get_vm_info", "get_vm_ip", "list_os_types", "export_vm"):
+        for ro_name in (
+            "list_vms",
+            "get_vm_info",
+            "get_vm_ip",
+            "list_os_types",
+            "export_vm",
+            "get_guest_process_list",
+        ):
             ann = by_name[ro_name].annotations
             assert ann is not None
             self.assertTrue(ann.read_only_hint)
@@ -1522,6 +2154,7 @@ class TestVirtualBoxMCP(unittest.TestCase):
         for dest_name in (
             "manage_power",
             "manage_snapshot",
+            "manage_range_snapshots",
             "execute_guest_command",
             "unattended_install",
             "delete_vm",
@@ -1530,6 +2163,22 @@ class TestVirtualBoxMCP(unittest.TestCase):
             assert ann is not None
             self.assertFalse(ann.read_only_hint)
             self.assertTrue(ann.destructive_hint)
+
+        for new_tool in (
+            "manage_network_adapters",
+            "manage_nat_networks",
+            "manage_hostonly_ifs",
+            "capture_nic_traffic",
+            "dump_guest_memory",
+            "send_guest_keystrokes",
+            "inspect_guest_metrics",
+            "manage_disk_images",
+        ):
+            ann = by_name[new_tool].annotations
+            assert ann is not None
+            self.assertFalse(ann.read_only_hint)
+            self.assertFalse(ann.destructive_hint)
+            self.assertFalse(ann.open_world_hint)
 
         reg_ann = by_name["register_vm"].annotations
         assert reg_ann is not None

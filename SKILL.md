@@ -35,10 +35,14 @@ Use this skill when interacting with local VirtualBox virtual machines through t
    - Pull logs or build artifacts back to the host with `copy_from_guest`.
    - Leave `username` and `password` omitted when `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` are configured in the MCP environment so credentials never enter the prompt context.
 
-6. **Networking & headless debugging**
-   - Discover a running VM's guest IP addresses and Guest Additions status with `get_vm_ip`.
+6. **Networking, lab isolation, packet capture, & forensics**
+   - Build isolated multi-VM lab subnets with `manage_nat_networks` (custom CIDR + DHCP) or `manage_hostonly_ifs` (controlled host-to-guest subnets + DHCP), and attach VMs via `manage_network_adapters` (`natnetwork`, `intnet`, `hostonly`, `none` for air-gapped sandboxes, plus `promisc_mode` and live link toggling).
+   - Checkpoint or roll back an entire running multi-VM range in one call with `manage_range_snapshots` (`action="snapshot"` or `action="revert", confirm=True`).
+   - Discover a running VM's guest IP addresses and Guest Additions status with `get_vm_ip`, and inspect active Guest Control jobs with `get_guest_process_list`.
    - Expose guest services to localhost with `manage_port_forwarding(..., action="add", is_running=True)`.
-   - If a VM fails to boot, hangs at a login/BIOS prompt, or exhibits GUI errors, capture its framebuffer with `take_vm_screenshot` and inspect the PNG.
+   - Capture network traffic directly at the hypervisor layer without touching the guest using `capture_nic_traffic(..., action="start" | "stop")`.
+   - Acquire volatile RAM images for host-side Volatility analysis with `dump_guest_memory` (pauses and resumes running VMs automatically for a consistent ELF core dump), monitor sandbox CPU/RAM/Disk spikes with `inspect_guest_metrics`, and attach read-only/immutable forensic or scratch drives with `manage_disk_images`.
+   - For early-boot prompts (GRUB, LUKS, BIOS) or VMs without Guest Additions, inject keystrokes with `send_guest_keystrokes` and inspect the display with `take_vm_screenshot`.
 
 7. **Provisioning, registration, appliances, media, and safe teardown**
    - Use `provision_kali_vm` as the default path for agent VMs, and `register_vm` to register existing `.vbox` machine definitions, extracted VM folders, or `.7z` VirtualBox archives.

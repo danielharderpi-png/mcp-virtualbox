@@ -6,7 +6,7 @@ Spin up headless sandboxes, snapshot state before risky changes, discover guest 
 
 ## Features
 
-- **22 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle (Kali Linux agent VM provisioning, `.vbox`/`.7z` registration, VM creation, unattended OS install, cloning, `.ova`/`.ovf` import/export, guarded deletion), snapshots, storage/ISO control, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, IP discovery, and screenshots.
+- **32 Specialized Tools + 1 MCP Resource (`vbox://vms`):** Full VM lifecycle (Kali Linux agent VM provisioning, `.vbox`/`.7z` registration, VM creation, unattended OS install, cloning, `.ova`/`.ovf` import/export, guarded deletion), isolated lab networking (`manage_network_adapters`, `manage_nat_networks`, `manage_hostonly_ifs`), hypervisor-level PCAP capture (`capture_nic_traffic`), memory & disk forensics (`dump_guest_memory`, `inspect_guest_metrics`, `manage_disk_images`), multi-VM range checkpointing (`manage_range_snapshots`), virtual keyboard injection (`send_guest_keystrokes`), Guest Control process listing (`get_guest_process_list`), snapshots, storage/ISO control, guest execution, bidirectional file copy, NAT port forwarding, shared folders, resource sizing, IP discovery, and screenshots.
 - **Native MCP Tool Annotations:** Accurate `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` hints so MCP clients know which operations mutate state.
 - **Credential Redaction & Env Fallbacks:** Passwords (`--password` / `--password-file`) are automatically scrubbed from error messages and logs, and can be supplied via `VBOX_GUEST_USER` / `VBOX_GUEST_PASSWORD` so credentials never appear in chat history.
 - **CLI Flag-Injection & Bounds Validation:** Rejects invalid/flag-prefixed identifiers (`--...`), validates port/resource ranges, and runs `VBoxManage` without `shell=True`.
@@ -97,6 +97,16 @@ Add the server to your MCP client configuration (Claude Desktop, Cline, Cursor, 
 | `copy_to_guest` | Copy a file or directory from the host into the guest VM (`recursive` supported). | Idempotent |
 | `copy_from_guest` | Copy a file or directory from the guest VM back to the host. | Idempotent |
 | `manage_port_forwarding` | `list`, `add`, or `delete` NAT port-forwarding rules (offline or live on running VMs). | Mutating |
+| `manage_network_adapters` | `list` or `configure` NICs 1–8 (`nat`, `natnetwork`, `intnet`, `hostonly`, `bridged`, `none`), link state, promiscuous mode, and MAC (offline or live). | Idempotent |
+| `manage_nat_networks` | `list`, `add`, `modify`, `remove`, `start`, or `stop` VirtualBox NAT Networks with custom IPv4 CIDR blocks and DHCP. | Mutating |
+| `manage_hostonly_ifs` | `list`, `create`, `configure`, `remove`, `dhcp-configure`, or `dhcp-remove` Host-Only interfaces and DHCP servers. | Mutating |
+| `capture_nic_traffic` | `status`, `start`, or `stop` hypervisor-level PCAP packet capture on a VM NIC (offline or live). | Idempotent |
+| `dump_guest_memory` | Capture a raw ELF core dump (`debugvm dumpvmcore`) of a running/paused VM's RAM for host-side Volatility analysis. | Mutating |
+| `inspect_guest_metrics` | `setup`, `query`, or `disable` hypervisor-level CPU, RAM, Disk, and Network metrics for a VM or host. | Idempotent |
+| `manage_disk_images` | `list`, `create`, `clone`, `set-type` (`normal`/`immutable`/`readonly`), `attach`, or `detach` virtual hard disks. | Mutating |
+| `manage_range_snapshots` | Batch `snapshot` or guarded `revert` (`confirm=True`) across all running lab VMs (or an explicit VM list). | Destructive |
+| `send_guest_keystrokes` | Send text, named special keys (`ENTER`, `ESC`, `F1`–`F12`, `CTRL_ALT_DEL`), or PS/2 scancodes without Guest Additions. | Mutating |
+| `get_guest_process_list` | List active VirtualBox Guest Control processes on a running VM. | Read-only, Idempotent |
 | `manage_shared_folders` | `list`, `add`, or `remove` permanent or transient shared folders. | Mutating |
 | `configure_vm_resources` | Update `cpus`, `memory_mb`, `vram_mb`, and `clipboard_mode` on a stopped VM. | Idempotent |
 | `clone_vm` | Create full or linked clones (from a snapshot) and register them. | Mutating |
